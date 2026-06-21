@@ -73,6 +73,7 @@ class HumanAgent:
     GOAL_FORCE_STRENGTH = 3.0
     SOCIAL_FORCE_STRENGTH = 1.0
     SOCIAL_FORCE_RANGE  = 1.5    # metres — how far social repulsion acts
+    GROUP_FORCE_RANGE = 4.0
     ROBOT_FORCE_STRENGTH = 1.5
     GROUP_FORCE_STRENGTH = 2.0   # Group members want to be next to each other in a zone
     ROBOT_FORCE_RANGE   = 1.0
@@ -305,7 +306,7 @@ class HumanAgent:
                 continue
             diff = self.pos - other.pos
             dist = np.linalg.norm(diff)
-            if other.group_id == self.group_id and 0.8 > dist > 3.0:
+            if other.group_id == self.group_id and 1.2 > dist:
                 magnitude = self.GROUP_FORCE_STRENGTH * np.exp(
                     -dist / self.GROUP_FORCE_RANGE
                 )

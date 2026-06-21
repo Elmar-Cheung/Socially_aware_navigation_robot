@@ -12,6 +12,7 @@ import affective_buffer as ab
 from affectivityML import affectivityML
 
 matplotlib.use('TkAgg')
+print(f"--- RUNNING PROCESS PID: {os.getpid()} ---")
 
 class WandbCallback(BaseCallback):
     def __init__(self, verbose=0):
@@ -23,18 +24,19 @@ class WandbCallback(BaseCallback):
                 "total_timesteps": 10000,
                 "num_humans": 25,
                 "width": 25,
-                "height": 30,
+                "height": 25,
             }
         )
 
     def _on_step(self):
         wandb.log({
-            'reward':          self.locals['rewards'][0],
-            'dist_to_goal':    self.locals['infos'][0].get('dist_to_goal', 0),
-            'time_used':       self.locals['infos'][0].get('time_used', 0),
-            'tot_soc_pen':     self.locals['infos'][0].get('tot_soc_pen', 0),
-            'move_reward':     self.locals['infos'][0].get('move_reward', 0),
-            'social_reward':   self.locals['infos'][0].get('social_reward', 0)
+            'reward':           self.locals['rewards'][0],
+            'dist_to_goal':     self.locals['infos'][0].get('dist_to_goal', 0),
+            'time_used':        self.locals['infos'][0].get('time_used', 0),
+            'tot_soc_pen':      self.locals['infos'][0].get('tot_soc_pen', 0),
+            'move_reward':      self.locals['infos'][0].get('move_reward', 0),
+            'social_reward':    self.locals['infos'][0].get('social_reward', 0),
+            'collision_reward': self.locals['infos'][0].get('collision_reward', 0)
         })
         return True
     
@@ -53,9 +55,8 @@ class WandbCallback(BaseCallback):
 
 
 # --- Training ---
-env = SocialNavEnv(width=25, height=25, num_humans=30)
+env = SocialNavEnv(width=25, height=25, num_humans=25)
 
-# Add this before model = PPO(...)
 os.makedirs("tensorboard_logs", exist_ok=True)
 os.makedirs("checkpoints", exist_ok=True)
 
@@ -65,8 +66,8 @@ model = SAC(
     device="cuda",
     tensorboard_log="./tensorboard_logs/",
     learning_rate=3e-4,
-    buffer_size=1000,
-    learning_starts=2500,
+    buffer_size=50000,
+    learning_starts=1000,
     train_freq=1,
     gradient_steps=1,
     tau=0.005,
@@ -83,14 +84,14 @@ checkpoint = CheckpointCallback(
 
 model.learn(total_timesteps=10000, callback=[checkpoint, WandbCallback()])
 
-model.save("1.zip")
+model.save("no_human.zip")
 
 buffer = ab.get_buffer()
 analyser = affectivityML()
 analyser.analyse(buffer)
 #----- Visualisation -----
 
-model = SAC.load("fix_approach_goal.zip", env=env)
+model = SAC.load("1.zip", env=env)
 
 # Reset to fresh episode
 obs, _ = env.reset()

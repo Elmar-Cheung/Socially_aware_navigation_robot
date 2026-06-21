@@ -4,7 +4,7 @@ import random
 
 class Robot:
     MAX_SPEED    = 3.0   # m/s
-    ARRIVAL_RADIUS = 0.2 # metres
+    ARRIVAL_RADIUS = 0.5 # metres
 
     def __init__(self, width, height):
         self.width   = width

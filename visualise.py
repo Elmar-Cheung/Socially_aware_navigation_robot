@@ -1,16 +1,19 @@
+import os
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
 import matplotlib
 matplotlib.use('TkAgg')
+
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 from social_nav_env import SocialNavEnv, draw
 from stable_baselines3 import SAC
 import glob
-import os
 
 # Load environment
 env = SocialNavEnv(width=15, height=15, num_humans=10)
   
-model = SAC.load("1.zip", env=env)
+model = SAC.load("no_human.zip", env=env)
 
 # Reset to fresh episode
 obs, _ = env.reset()

@@ -1,6 +1,7 @@
 # Python virtual environment
 venv/
 .env
+wandb/
 
 # Python cache
 __pycache__/

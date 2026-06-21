@@ -7,6 +7,8 @@ from robot import Robot
 import numpy as np
 import random
 from collections import deque
+import scipy.ndimage as ndimage
+import heapq
 
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
@@ -35,20 +37,16 @@ class GroupSpawner:
 
         self._fill_spawn_queue()
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
-
     def try_spawn(self):
         # Force respawn if population drops too low
         if len(self.humans) < 15 and not self.spawn_queue:
             self.remaining += 10
             self._fill_spawn_queue()
         
-        if len(self.humans) > 45:
+        if len(self.humans) > 35:
             self.remaining -= 10
             self._fill_spawn_queue()
-        
+
         while self.spawn_queue:
             group_size = self.spawn_queue[0]
             positions = self._find_free_edge_positions(group_size)
@@ -87,10 +85,6 @@ class GroupSpawner:
         ]
         in_radius.sort(key=lambda h: np.linalg.norm(h.pos - pos))
         return in_radius[:top_n]
-
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
 
     def _fill_spawn_queue(self):
         while self.remaining > 0:
@@ -217,7 +211,7 @@ class GroupSpawner:
         return np.array([gx, gy], dtype=np.float32)
 
 class Obstacle:
-    def __init__(self, x, y, radius=0.5):
+    def __init__(self, x, y, radius):
         self.pos = np.array([x, y], dtype=np.float32)
         self.radius = radius
 
@@ -240,16 +234,23 @@ class SocialNavEnv(gym.Env):
         self.tot_soc_pen = 0.0
         self.move_reward = 0.0
         self.social_reward = 0.0
+        self.collision_reward = 0.0
         self.clipped_action = [0.0, 0.0]
+        self.prev_obs = None
+        self.field = None
+        self.trajectory = None
+        self.prev_field = None
+        self.prev_trajectory = None
+        self.human_states = np.zeros((10, 7), dtype=np.float32)
 
         self.observation_space = gym.spaces.Dict({
             'agents': gym.spaces.Box(
-                low=-np.inf, high=np.inf,
-                shape=(10, 7), dtype=np.float32
+                low=-50, high=50,
+                shape=(10, 5), dtype=np.float32
             ),
-            'robot_state': gym.spaces.Box(
+            'field': gym.spaces.Box(
                 low=-np.inf, high=np.inf,
-                shape=(3,), dtype=np.float32
+                shape=(7, 7), dtype=np.float32
             )
         })
 
@@ -265,42 +266,75 @@ class SocialNavEnv(gym.Env):
             high=np.array([1.0,  1.0]),
             dtype=np.float32
         )
-    
-    def _cast_lidar(self, num_rays=200, max_range=4.0):
-        """
-        Cast rays around robot.
-        hit_type 0 is freespace
-        hit_type 1 is obstacle/human
-        """
+
+    def _cast_lidar(self, num_rays=100, max_range=7.0):
         robot_pos = self.robot.pos
         angles = np.linspace(0, 2 * np.pi, num_rays, endpoint=False)
-        lidar = np.zeros((num_rays, 3), dtype=np.float32)
+        
+        # 1. Vectorize ray directions shape: (num_rays, 2)
+        ray_dirs = np.stack([np.cos(angles), np.sin(angles)], axis=1)
+        
+        # Initialize all distances to max range
+        hit_distances = np.full(num_rays, max_range, dtype=np.float32)
+        
+        # 2. Extract all obstacle positions and radiuses into arrays
+        if len(self.obstacle) > 0:
+            obs_positions = np.array([obs.pos for obs in self.obstacle], dtype=np.float32) # (N, 2)
+            obs_radii = np.array([obs.radius for obs in self.obstacle], dtype=np.float32)     # (N,)
+            
+            # Vectorized Ray-Circle Intersection for ALL rays and ALL obstacles at once
+            # oc shape: (1, N, 2) | ray_dirs shape: (num_rays, 1, 2)
+            oc = robot_pos - obs_positions[np.newaxis, :, :] 
+            dirs = ray_dirs[:, np.newaxis, :]
+            
+            a = 1.0 # np.dot(ray_dir, ray_dir) is always 1.0 since cos^2 + sin^2 = 1
+            b = 2.0 * np.sum(oc * dirs, axis=2) # shape: (num_rays, N)
+            c = np.sum(oc * oc, axis=2) - obs_radii**2 # shape: (num_rays, N)
+            
+            discriminant = b**2 - 4.0 * a * c # shape: (num_rays, N)
+            
+            # Mask where intersection happens
+            valid_mask = discriminant >= 0
+            sqrt_disc = np.sqrt(np.maximum(discriminant, 0))
+            
+            t1 = (-b - sqrt_disc) / 2.0
+            t2 = (-b + sqrt_disc) / 2.0
+            
+            # Check valid distances (> 0.01)
+            t1_valid = np.where((t1 > 0.01) & valid_mask, t1, max_range)
+            t2_valid = np.where((t2 > 0.01) & valid_mask, t2, max_range)
+            min_t = np.minimum(t1_valid, t2_valid)
+            
+            # Get the absolute closest hit for each individual ray across all obstacles
+            closest_hit = np.min(min_t, axis=1)
+            hit_distances = np.minimum(hit_distances, closest_hit)
+
+        # Return shape (num_rays, 2) matching your original format
+        lidar = np.stack([hit_distances, angles], axis=1)
+        return lidar
+    """
+    def _cast_lidar(self, num_rays=100, max_range=7.0):
+
+        Cast rays around robot.
+
+        robot_pos = self.robot.pos
+        angles = np.linspace(0, 2 * np.pi, num_rays, endpoint=False)
+        lidar = np.zeros((num_rays, 2), dtype=np.float32)
 
         for i, angle in enumerate(angles):
             direction = np.array([np.cos(angle), np.sin(angle)], dtype=np.float32)
             hit_dist = max_range
-            hit_type = 0
 
-            # Check obstacles
-            for obs in self.obstacles:
-                d = self._ray_circle_intersect(robot_pos, direction, obs.pos, obs.radius)
+            for obs in self.obstacle:
+                d = self._ray_dist(robot_pos, direction, obs.pos, obs.radius)
                 if d is not None and d < hit_dist:
                     hit_dist = d
-                    hit_type = 1
 
-            # Check humans
-            for human in self.spawner.humans:
-                d = self._ray_circle_intersect(robot_pos, direction, human.pos, radius=0.3)
-                if d is not None and d < hit_dist:
-                    hit_dist = d
-                    hit_type = 1
-
-            lidar[i] = [hit_dist, hit_type, angle]
+            lidar[i] = [hit_dist, angle]
 
         return lidar
 
     def _ray_dist(self, ray_origin, ray_dir, circle_center, radius):
-
         oc = ray_origin - circle_center
         a = np.dot(ray_dir, ray_dir)
         b = 2.0 * np.dot(oc, ray_dir)
@@ -319,27 +353,164 @@ class SocialNavEnv(gym.Env):
         if t2 > 0.01:
             return t2
         return None
-    
+    """
 
+    def _get_costmap(self, lidar, map_size=1.0, resolution=0.05, robot_radius=0.3):
+        L_dist = lidar[:, 0]
+        L_angle = lidar[:, 1]
+
+        grid_cells = int(map_size / resolution)
+        costmap = np.zeros((grid_cells, grid_cells), dtype=np.uint8)
+        center = grid_cells // 2
+
+        obstacle_map = L_dist < 7.0
+        d_obs = L_dist[obstacle_map]
+        a_obs = L_angle[obstacle_map]
+
+        if not np.any(obstacle_map):
+            return costmap
+        
+        x_local = d_obs * np.cos(a_obs)
+        y_local = d_obs * np.sin(a_obs)
+
+        x_grid = (x_local / resolution).astype(np.int32) + center
+        y_grid = (y_local / resolution).astype(np.int32) + center
+
+        valid_bound = (
+            (x_grid >= 0)
+            & (x_grid < grid_cells)
+            & (y_grid >= 0)
+            & (y_grid < grid_cells)
+        )
+        x_grid = x_grid[valid_bound]
+        y_grid = y_grid[valid_bound]
+
+        costmap[y_grid, x_grid] = 255
+
+        pixel_dist = ndimage.distance_transform_edt(costmap != 255)
+        pixel_radius = robot_radius / resolution
+
+        inflation_mask = (pixel_dist > 0) & (pixel_dist <= pixel_radius)
+        gradual_cost = 128 * (1.0 - (pixel_dist[inflation_mask] / pixel_radius))
+
+        costmap[inflation_mask] = gradual_cost.astype(np.uint8)
+        costmap[y_grid, x_grid] = 255
+
+        return costmap
+        
+    
+    def dijkstre_field(self, costmap, rel_goal_pos, penalty_mult=0.5, resolution = 0.05):
+        new_cost = self.crop_field(costmap, 7)
+        height, width = new_cost.shape
+        start = (width // 2, height // 2)
+        center = width // 2
+
+        x, y = rel_goal_pos[0], rel_goal_pos[1]
+        half_extent_m = center * resolution        # physical half-size of the 7x7 window
+        scale = max(abs(x), abs(y), 1e-6)
+        t = min(1.0, half_extent_m / scale)
+
+        sub_x, sub_y = x * t, y * t
+        x_g = int(round(sub_x / resolution)) + center
+        y_g = int(round(sub_y / resolution)) + center
+
+        grid_cell_max = width - 1
+        x_g = max(0, min(x_g, grid_cell_max))
+        y_g = max(0, min(y_g, grid_cell_max))
+        goal = (x_g, y_g)
+
+        if not (0 <= goal[0] < width and 0 <= goal[1] < height):
+            return None, None
+        
+        if new_cost[goal[1], goal[0]] == 255:
+            found_alternative = False
+            for dx, dy in [
+                (0, 1), (0, -1), (1, 0), (-1, 0),
+                (1, 1), (1, -1), (-1, 1), (-1, -1),
+            ]:
+                nx, ny = goal[0] + dx, goal[1] + dy
+                if 0 <= nx < width and 0 <= ny < height and new_cost[ny, nx] < 255:
+                    goal = (nx, ny)
+                    found_alternative = True
+                    break
+            if not found_alternative:
+                return None, None
+
+        directions = [
+            (0, 1, 1.0), (0, -1, 1.0), (1, 0, 1.0), (-1, 0, 1.0),
+            (1, 1, 1.414), (1, -1, 1.414), (-1, 1, 1.414), (-1, -1, 1.414),
+        ]
+
+        priority_queue = [(0.0, goal)]
+        g_score = {goal: 0.0}
+        trajectory = {}
+        
+        while priority_queue:
+            g, current = heapq.heappop(priority_queue)
+
+            if g > g_score.get(current, np.inf):
+                continue
+            x, y = current
+            current_cost = new_cost[y, x]
+
+            for dx, dy, step_cost in directions:
+                nx, ny = x + dx, y + dy
+                if not (0 <= nx < width and 0 <= ny < height):
+                    continue
+                if new_cost[ny, nx] == 255:
+                    continue
+
+                tentative_g_score = g + step_cost + (current_cost * penalty_mult)
+                neighbour = (nx, ny)
+
+                if tentative_g_score < g_score.get(neighbour, np.inf):
+                    g_score[neighbour] = tentative_g_score
+                    trajectory[neighbour] = current
+                    heapq.heappush(priority_queue, (tentative_g_score, neighbour))
+
+        field = np.full((height, width), np.inf, dtype=np.float32)
+        for (cx, cy), val in g_score.items():
+            field[cy, cx] = val
+
+        return field, trajectory
+
+    def crop_field(self, field, patch_size, cap=100):
+        center = field.shape[0] // 2
+        half = patch_size // 2
+        patch = field[center-half: center+half+1, center-half: center+half+1].copy()
+        patch = np.clip(patch, -cap, cap)
+        patch -= patch[half, half]
+
+        return patch.astype(np.float32)
+    
     def _get_obs(self):
+        self.prev_field = self.field
+        self.prev_trajectory = self.trajectory
         obs = self.robot.get_observation(self.spawner.humans)
-        agent_matrix = np.zeros((10, 7), dtype=np.float32)
+        agent_matrix = np.zeros((10, 5), dtype=np.float32)
         for i, human in enumerate(obs[:10]):
             rel_x = human[0] - self.robot.pos[0]
             rel_y = human[1] - self.robot.pos[1]
-            agent_matrix[i] = [rel_x, rel_y, human[2], human[3], human[4], human[7],
+            self.human_states[i] = [rel_x, rel_y, human[2], human[3], human[4], human[7],
                             np.sqrt(rel_x**2 + rel_y**2)]
-        
+            agent_matrix[i] = [rel_x, rel_y, human[2], human[7],
+                            np.sqrt(rel_x**2 + rel_y**2)]
         gx, gy = self.robot.goal if self.robot.goal is not None else self.robot.pos
         dist = np.linalg.norm(self.robot.pos - self.robot.goal)
         inv_dist = 1.0 / (dist + 0.1)
         rel_goal_x = gx - self.robot.pos[0]
         rel_goal_y = gy - self.robot.pos[1]
-        robot_state = np.array([
-            rel_goal_x, rel_goal_y, inv_dist
-        ], dtype=np.float32)
-        
-        return {'agents': agent_matrix, 'robot_state': robot_state}
+
+        lidar = self._cast_lidar()
+        rel_goal = (rel_goal_x, rel_goal_y)
+        costmap = self._get_costmap(lidar)
+        self.field, self.trajectory = self.dijkstre_field(costmap, rel_goal)
+        if self.field is None:
+            field_obs = np.full((7, 7), 100.0, dtype=np.float32)
+        else:
+            field_obs = np.nan_to_num(self.field, nan=0.0, posinf=100.0, neginf=-100.0).astype(np.float32)
+        self.field = field_obs
+        return {'agents': agent_matrix, 'field': field_obs}
 
     def _get_info(self):
         gx, gy = self.robot.goal if self.robot.goal is not None else self.robot.pos
@@ -351,15 +522,16 @@ class SocialNavEnv(gym.Env):
             'time_used':     self.robot.time_stamp,
             'tot_soc_pen':   self.tot_soc_pen,
             'move_reward':   self.move_reward,
-            'social_reward': self.social_reward
+            'social_reward': self.social_reward,
+            'collision_reward': self.collision_reward
         }
 
-    def _get_reward(self, arrived, obs):
+    def _get_reward(self, arrived, obs, action):
         self.move_reward = 0.0
         self.social_reward = 0.0
         self.tot_soc_pen = 0.0
+        self.collision_reward = 0.0
 
-        agent_matrix = obs['agents']
         self.safe_conduct = True
         in_social_zone = False
         total_social_penalty = 0.0
@@ -369,32 +541,37 @@ class SocialNavEnv(gym.Env):
         if arrived:
             reward += 10.0
             return reward
-        
+            
         # Distance improvement reward
-        if hasattr(self, '_prev_dist'):
-            move = self._prev_dist - dist
-            if dist < 0.5:
-                scale = 6.0
-            elif dist < 1.5:
-                scale = 4.0
-            elif dist < 2.7:
-                scale = 2.5
+        resolution = 0.05
+        if self.prev_field is not None:
+            center = self.prev_field.shape[0] // 2
+            dx = action[0] * self.dt
+            dy = action[1] * self.dt
+            move_x = int(round(dx / resolution)) + center
+            move_y = int(round(dy / resolution)) + center
+            move_x = np.clip(move_x, 0, self.prev_field.shape[1] - 1)
+            move_y = np.clip(move_y, 0, self.prev_field.shape[0] - 1)
+
+            cost = self.prev_field[move_y, move_x]
+            if not np.isfinite(cost):
+                cost = 50.0
+
+        # reward -= cost / 2
+        # self.move_reward -= cost / 2
+
+        if self.prev_obs is not None:
+            f = self.prev_obs['field']
+            field = self.crop_field(f, 5)
+            rank_matrix = np.argsort(np.argsort((-field).ravel())).reshape(field.shape)
+
+            move_x = int(round(dx / resolution)) + 2
+            move_y = int(round(dy / resolution)) + 2    
+            if 0 <= move_y < 5 and 0 <= move_x < 5:
+                reward += (rank_matrix[move_y][move_x] - 12) / 2
+                self.move_reward += (rank_matrix[move_y][move_x] - 12) / 2
             else:
-                scale = 1.5
-
-            if abs(move) < 0.01:
-                reward -= 0.05
-                self.move_reward -= 0.05
-            else:
-                reward += move * scale   # works for both + and - move
-                self.move_reward += move * scale
-        else:
-            move = 0.0
-
-        reward -= 0.01 *(dist / self._prev_dist)
-        self.move_reward -= 0.01 *(dist / self._prev_dist)
-
-        self._prev_dist = dist
+                print("Out of bound")
 
         # Step penalty
         reward -= 0.001
@@ -406,26 +583,33 @@ class SocialNavEnv(gym.Env):
             reward -= 0.1  # penalty for being near boundary
 
         # Social penalty
-        for i in range(len(agent_matrix)):
-            _, _, _, valence, intensity, _, _ = agent_matrix[i]
+        for i in range(len(self.human_states)):
+            _, _, _, valence, intensity, _, _ = self.human_states[i]
             if valence < 0.0:
                 self.safe_conduct = False
                 total_social_penalty += abs(valence) * intensity * 10.0
 
         if self.safe_conduct:
-            for i in range(len(agent_matrix)):
-                _, _, speed, _, _, _, agent_dist = agent_matrix[i]
+            for i in range(len(self.human_states)):
+                _, _, speed, _, _, _, agent_dist = self.human_states[i]
                 if speed == 0.0 and agent_dist == 0.0:
                     continue
                 if agent_dist < 4:
                     in_social_zone = True
                     break
 
-        if in_social_zone and self.safe_conduct and move > 0:
-            reward += move * 2.0
-            self.social_reward = move * 2.0
+        if in_social_zone and self.safe_conduct and cost < 0:
+            reward += cost * 2.0
+            self.social_reward = cost * 2.0
 
             # Social reward for safe approach
+
+        for o in  self.obstacle:
+            dist = np.linalg.norm(self.robot.pos - o.pos)
+            if dist <= (0.3 + o.radius):
+                # Collide with obstacle
+                reward -= 5.0
+                self.collision_reward -= 5.0
 
         reward -= total_social_penalty
         self.tot_soc_pen = total_social_penalty
@@ -437,6 +621,16 @@ class SocialNavEnv(gym.Env):
 
         self.robot.time_stamp = 0
         self.robot.assign_goal()
+        check = True
+        while check:
+            check = False
+            for o in self.obstacle:
+                dist = np.linalg.norm(self.robot.goal - o.pos)
+                if dist < o.radius:
+                    self.robot.assign_goal()
+                    check = True
+                    break
+
         self.previous_reward = 0.0
         
         self._prev_dist = np.linalg.norm(self.robot.pos - self.robot.goal)
@@ -450,13 +644,14 @@ class SocialNavEnv(gym.Env):
         self.robot.pos[0] = np.clip(self.robot.pos[0], 0.0, self.width)
         self.robot.pos[1] = np.clip(self.robot.pos[1], 0.0, self.height)
 
+        self.prev_obs = self._get_obs()
         for human in self.spawner.humans:
             human.step(self.dt, self.spawner.humans, self.robot)
             if human.arrived:
                 self.spawner.check_group_arrived(human.group_id)
         
         obs    = self._get_obs()
-        reward = self._get_reward(arrived, obs)
+        reward = self._get_reward(arrived, obs, action)
 
         ab.collect(
             obs = obs,
@@ -553,6 +748,19 @@ def draw(env, ax):
         ax.text(x, y, str(agent.group_id % 10), ha='center', va='center',
                 fontsize=5, color='black', zorder=3)
         
+    obstacle = [
+        Obstacle(8,  8,  0.75),
+        Obstacle(15, 10, 0.75),
+        Obstacle(5,  20, 0.5),
+        Obstacle(20, 5,  0.5),
+        Obstacle(20, 20, 1.0)
+    ]
+    for o in obstacle:
+        pos, rad = o.pos, o.radius
+        circle = mpatches.Circle(pos, rad, color='gray', alpha=0.6)
+        ax.add_patch(circle)
+
+
     rx, ry = env.robot.pos
     ax.plot(rx, ry, marker='*', color='orange',
             markersize=18, markeredgecolor='white',
