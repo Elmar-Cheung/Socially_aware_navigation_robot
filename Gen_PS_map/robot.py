@@ -4,7 +4,7 @@ import random
 
 class Robot:
     MAX_SPEED    = 1.0   # m/s
-    ARRIVAL_RADIUS = 0.5 # metres
+    ARRIVAL_RADIUS = 0.1 # metres
 
     def __init__(self, width, height):
         self.width   = width
@@ -29,7 +29,7 @@ class Robot:
         Assigns a new random goal biased toward the opposite side
         of the environment from the robot's current position.
         """
-        margin = 1.5
+        margin = 0.2
         rx, ry = self.pos
 
         # Bias goal to opposite half of environment
@@ -85,12 +85,7 @@ class Robot:
     # Observation
     # ------------------------------------------------------------------
 
-    def get_observation(self, humans, radius=5.0, top_n=5):
-        """
-        Returns (10, 7) numpy array of nearby human features,
-        padded with zeros if fewer than top_n humans are in range.
-        Matches the observation format expected by RobotEnv.
-        """
+    def get_observation(self, humans, radius=2.5, top_n=1):
         nearby = [
             h for h in humans
             if np.linalg.norm(h.pos - self.pos) <= radius

@@ -19,8 +19,15 @@ from matplotlib.animation import FuncAnimation
 import skfmm
 from stable_baselines3.common.callbacks import BaseCallback
 
+from stable_baselines3.common.buffers import DictReplayBuffer
 
-global prioritise_replay
+class HumanOnlyReplayBuffer(DictReplayBuffer):
+    def add(self, obs, next_obs, action, reward, done, infos):
+        if not any(info.get("human_nearby", False) for info in infos):
+            return
+        super().add(obs, next_obs, action, reward, done, infos)
+
+        
 class GroupSpawner:
     """
     Spawns groups
@@ -62,24 +69,17 @@ class GroupSpawner:
             self._spawn_group(positions, group_size)
 
     def check_group_arrived(self, group_id):
-        """
-        Check if all m,embers arrive, if yes, fill the spawbn queue
-        """
         members = self.group_members.get(group_id, [])
         if not members:
             return
         if all(m.arrived for m in members):
-            self.group_arrived[group_id] = True
-            for member in members:
-                if member in self.humans:
-                    self.humans.remove(member)
-            del self.group_members[group_id]
-            del self.group_goals[group_id]
+            # Assign a new goal, reusing the current position as the "spawn" reference
+            new_goal = self._assign_group_goal(members[0].pos, len(members))
+            self.group_goals[group_id] = new_goal
 
-            # Spawn replacement humans
-            num_new = len(members)
-            self.remaining += num_new
-            self._fill_spawn_queue()
+            for member in members:
+                member.goal = new_goal.copy()
+                member.arrived = False
 
     def get_nearby_humans(self, pos, radius=4.0, top_n=10):
         """
@@ -95,10 +95,13 @@ class GroupSpawner:
     def _fill_spawn_queue(self):
         while self.remaining > 0:
             is_group = random.random() < 0.2
+            """
             if is_group and self.remaining > 1:
                 group_size = random.randint(2, min(5, self.remaining))
             else:
                 group_size = 1
+            """
+            group_size = self.remaining
             self.spawn_queue.append(group_size)
             self.remaining -= group_size
 
@@ -107,14 +110,20 @@ class GroupSpawner:
         """
         Finds position for groups to be spawned
         """
-        margin = 0.5  # distance from actual wall boundary
+        margin = 0.2  # distance from actual wall boundary
 
         edges = {
+            'top':    [(float(x), self.height - margin)
+                        for x in np.linspace(margin, self.width - margin,
+                                               int(self.width * 2))],
+            'bottom': [(float(x), margin)
+                        for x in np.linspace(margin, self.width - margin,
+                                               int(self.width * 2))],
             'left':   [(margin, float(y))
-                       for y in np.linspace(margin, self.height - margin,
+                        for y in np.linspace(margin, self.height - margin,
                                             int(self.height * 2))],
             'right':  [(self.width - margin, float(y))
-                       for y in np.linspace(margin, self.height - margin,
+                        for y in np.linspace(margin, self.height - margin,
                                             int(self.height * 2))]
         }
 
@@ -187,7 +196,7 @@ class GroupSpawner:
         Assigns a goal on the opposite side of spawn location.
         """
         x, y = float(spawn_pos[0]), float(spawn_pos[1])
-        margin = 1.0
+        margin = 0.2
 
         # Determine which edge the group spawned on
         left   = x < self.width * 0.1
@@ -217,7 +226,7 @@ class Obstacle:
 
 
 class SocialNavEnv(gym.Env):
-    def __init__(self, width=20, height=20, num_humans=40):
+    def __init__(self, width=5, height=5, num_humans=1):
         self.obstacle = []
 
         self.width = width
@@ -235,13 +244,17 @@ class SocialNavEnv(gym.Env):
         self.check_frequ = 1000
         self.obs_buffer = deque(maxlen=1000)
         self.safety_trigger = False
-
+        self._human_detected = False
         self.observation_space = gym.spaces.Dict({
             'agents': gym.spaces.Box(
                 low=-50, high=50,
-                shape=(5, 7), dtype=np.float32
+                shape=(1, 7), dtype=np.float32
             )
         })
+
+        self._prev_raw_orientation = None
+        self._unwrap_offset = 0.0
+        self.h_arrived = 0
 
         self.robot = Robot(self.width, self.height)
         self.spawner = GroupSpawner(self.width, self.height, self.num_humans)
@@ -251,14 +264,15 @@ class SocialNavEnv(gym.Env):
         self.previous_reward = 0.0
         # Small action space - velocity commands
         self.action_space = gym.spaces.Box(
-            low=-3.0, high=3.0,
-            shape=(5, 3), dtype=np.float32
+            low=0, high=3.0,
+            shape=(1, 3), dtype=np.float32
         )
     
     def _get_obs(self):
         obs = self.robot.get_observation(self.spawner.humans)
-        agent_matrix = np.zeros((5, 7), dtype=np.float32)
-        for i, human in enumerate(obs[:4]):
+        self._human_detected = len(obs) > 0
+        agent_matrix = np.zeros((1, 7), dtype=np.float32)
+        for i, human in enumerate(obs[:1]):
             rel_x       = human[0] - self.robot.pos[0]
             rel_y       = human[1] - self.robot.pos[1]
             valence     = human[2]
@@ -279,6 +293,9 @@ class SocialNavEnv(gym.Env):
     def _get_info(self):
         gx, gy = self.robot.goal if self.robot.goal is not None else self.robot.pos
         goal = self.robot.goal if self.robot.goal is not None else self.robot.pos
+        human_matrix = self._get_obs()["agents"]
+        raw = float(human_matrix[0, 2]) if len(human_matrix) > 0 else 0.0
+
         return {
             'robot_pos':     tuple(self.robot.pos),
             'goal_pos':      (gx, gy),
@@ -286,12 +303,31 @@ class SocialNavEnv(gym.Env):
             'time_used':     self.robot.time_stamp,
             'tot_soc_pen':   self.tot_soc_pen,
             'social_reward': self.social_reward,
-            'collision_reward': self.collision_reward
+            'collision_reward': self.collision_reward,
+            'human_nearby':  self._human_detected,
+            'orientation':            raw,
+            'orientation_unwrapped':  self._live_unwrap(raw),
+            'speed':         human_matrix[0, 3],
+            'human_arrived': self.h_arrived,
         }
+
+    def _live_unwrap(self, raw):
+        if self._prev_raw_orientation is None:
+            self._prev_raw_orientation = raw
+            return raw
+        delta = raw - self._prev_raw_orientation
+        if delta > np.pi:
+            self._unwrap_offset -= 2 * np.pi
+        elif delta < -np.pi:
+            self._unwrap_offset += 2 * np.pi
+        self._prev_raw_orientation = raw
+        return raw + self._unwrap_offset
+
 
     def _get_reward(self, obs):
         reward = 0.0
         self.tot_soc_pen = 0.0
+        self.social_reward = 0.0
         human_matrix = obs["agents"]
 
         if self.safety_trigger:
@@ -302,9 +338,9 @@ class SocialNavEnv(gym.Env):
 
         for i in range(len(human_matrix)):
             _, _, _, _, _, valence, intensity = human_matrix[i]
-            if valence < 0.0:
-                reward += valence * intensity * 5.0
-                self.tot_soc_pen += valence * intensity * 5.0
+            reward += valence * intensity * 5.0
+            self.tot_soc_pen += valence * intensity * 5.0
+
 
         return reward
 
@@ -349,7 +385,10 @@ class SocialNavEnv(gym.Env):
         for human in self.spawner.humans:
             human.step(self.dt, self.spawner.humans, self.robot)
             if human.arrived:
+                self.h_arrived = 1
                 self.spawner.check_group_arrived(human.group_id)
+            else:
+                self.h_arrived = 0
         
         obs    = self._get_obs()
         reward = self._get_reward(obs)
@@ -358,7 +397,7 @@ class SocialNavEnv(gym.Env):
         
         return obs, reward, terminate, False, self._get_info()
 
-    def _get_movement(self, obs, action, rel_goal, map_size=3.5, resolution=0.025, robot_radius=0.3):
+    def _get_movement(self, obs, action, rel_goal, map_size=5.0, resolution=0.025, robot_radius=0.3):
         human_matrix = obs["agents"]
 
         mask = human_matrix[:, 2] != 0.0

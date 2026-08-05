@@ -6,13 +6,14 @@ matplotlib.use('TkAgg')
 
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
-from social_nav_env import SocialNavEnv, draw
+#from social_nav_env import SocialNavEnv, draw
+from dist_navigation_rl import SocialNavEnv, draw
 from stable_baselines3 import SAC
 import glob
 
 
 # Load environment
-env = SocialNavEnv(width=10, height=10, num_humans=2)
+env = SocialNavEnv(width=4, height=4, num_humans=1)
 
 model = SAC.load("C:/Users/Elmar/Desktop/MTP/All_models/Gen_PS_map/no_human", env=env)
 

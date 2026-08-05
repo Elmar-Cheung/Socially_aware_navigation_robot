@@ -7,7 +7,8 @@ os.environ["WANDB_API_KEY"] = os.environ.get("WANDB_API_KEY", "")
 
 import wandb
 import matplotlib
-from social_nav_env import SocialNavEnv, draw
+from social_nav_env import SocialNavEnv, draw, HumanOnlyReplayBuffer
+#from dist_navigation_rl import SocialNavEnv, draw, HumanOnlyReplayBuffer
 from stable_baselines3 import SAC
 from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback
 import matplotlib.pyplot as plt
@@ -22,7 +23,7 @@ import stable_baselines3
 import affective_buffer as ab
 import numpy as np
 
-"""
+
 # Now login and init
 wandb.login(key=os.environ["WANDB_API_KEY"], relogin=True)
 
@@ -35,7 +36,7 @@ wandb.init(
     config={
         "algorithm": "SAC",
         "total_timesteps": 100000,
-        "num_humans": 10,
+        "num_humans": 1,
         "width": 10,
         "height": 10,
     }
@@ -54,7 +55,10 @@ class WandbCallback(BaseCallback):
             'tot_soc_pen':      self.locals['infos'][0].get('tot_soc_pen', 0),
             'move_reward':      self.locals['infos'][0].get('move_reward', 0),
             'social_reward':    self.locals['infos'][0].get('social_reward', 0),
-            'collision_reward': self.locals['infos'][0].get('collision_reward', 0)
+            'orientation':      self.locals['infos'][0].get('orientation', 0),
+            'orientation_unwrapped': self.locals['infos'][0].get('orientation_unwrapped', 0),
+            'speed':            self.locals['infos'][0].get('speed', 0),
+            'arrive':           self.locals['infos'][0].get('human_arrived', 0)
         })
         return True
     
@@ -70,7 +74,7 @@ class WandbCallback(BaseCallback):
     
     def _on_training_end(self):
         pass # Handle closing cleanly at the end of the global script instead
-"""
+
 BASE_DIR = os.path.join("C:\\", "Users", "Elmar", "Desktop", "MTP", "All_models", "Gen_PS_map")
 os.makedirs(os.path.join(BASE_DIR, "tensorboard_logs"), exist_ok=True)
 os.makedirs(os.path.join(BASE_DIR, "checkpoints"), exist_ok=True)
@@ -78,10 +82,11 @@ os.makedirs(os.path.join(BASE_DIR, "checkpoints"), exist_ok=True)
 # --- Initialization ---
 # Initialize wandb directly in the main thread execution context
 
-env = SocialNavEnv(width=10, height=10, num_humans=2)
+env = SocialNavEnv(width=5, height=5, num_humans=2)
 
 model = SAC(
     "MultiInputPolicy", env,
+    replay_buffer_class=HumanOnlyReplayBuffer,
     verbose=1,
     device="cuda",
     tensorboard_log=os.path.join(BASE_DIR, "tensorboard_logs"),
@@ -103,11 +108,11 @@ checkpoint = CheckpointCallback(
 )
 
 # --- Training Loop ---
-model.learn(total_timesteps=10000, callback=[checkpoint])
+model.learn(total_timesteps=10000, callback=[checkpoint, WandbCallback()])
 
 # --- Secure Shutdown and Save ---
 print("Training finished. Safely synchronizing and closing W&B threads...")
-# wandb.finish() # Crucial: This unlocks the training process stream
+wandb.finish() # Crucial: This unlocks the training process stream
 
 # Save to absolute path to guarantee visualize.py accesses the same location
 final_save_path = os.path.join(BASE_DIR, "no_human.zip")
