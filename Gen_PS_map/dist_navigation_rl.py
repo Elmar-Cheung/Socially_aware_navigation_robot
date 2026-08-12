@@ -44,6 +44,7 @@ class GroupSpawner:
         self.spawn_queue = deque()      # queued group sizes to spawn
         self.remaining = num_humans     # humans yet to be spawned
         self.group_id_counter = 0
+        self.human_id_counter = 0
 
         self._fill_spawn_queue()
 
@@ -94,13 +95,15 @@ class GroupSpawner:
     def _fill_spawn_queue(self):
         while self.remaining > 0:
             is_group = random.random() < 0.2
+            """
             if is_group and self.remaining > 1:
                 group_size = random.randint(2, min(5, self.remaining))
             else:
                 group_size = 1
+            """
+            group_size = self.remaining
             self.spawn_queue.append(group_size)
             self.remaining -= group_size
-
 
     def _find_free_edge_positions(self, group_size, min_separation=1.5):
         """
@@ -165,7 +168,8 @@ class GroupSpawner:
 
         group_id = self.group_id_counter
         self.group_id_counter += 1
-
+        human_id = self.human_id_counter
+        self.human_id_counter += 1
         speed = random.uniform(0.5, 1.5)  # shared group speed
         goal = self._assign_group_goal(positions[0], group_size)
         members = []
@@ -175,6 +179,7 @@ class GroupSpawner:
                 pos=pos.copy(),
                 goal=goal.copy(),
                 group_id=group_id,
+                human_id=human_id,
                 group_size=group_size,
                 speed=speed,
                 width=self.width,
@@ -244,7 +249,7 @@ class SocialNavEnv(gym.Env):
         self.observation_space = gym.spaces.Dict({
             'agents': gym.spaces.Box(
                 low=-50, high=50,
-                shape=(1, 5), dtype=np.float32
+                shape=(2, 5), dtype=np.float32
             )
         })
 
@@ -261,13 +266,13 @@ class SocialNavEnv(gym.Env):
         # Small action space - velocity commands
         self.action_space = gym.spaces.Box(
             low=0, high=3.0,
-            shape=(1, 3), dtype=np.float32
+            shape=(2, 3), dtype=np.float32
         )
     
     def _get_obs(self):
         obs = self.robot.get_observation(self.spawner.humans)
         self._human_detected = len(obs) > 0
-        agent_matrix = np.zeros((1, 5), dtype=np.float32)
+        agent_matrix = np.zeros((2, 5), dtype=np.float32)
         for i, human in enumerate(obs[:1]):
             rel_x       = human[0] - self.robot.pos[0]
             rel_y       = human[1] - self.robot.pos[1]
@@ -677,6 +682,16 @@ PERSONALITY_MARKERS = {
     'chill':   'D',
 }
 
+def get_personality(stability, plasticity):
+    if stability >= 0 and plasticity >= 0:
+        return 'regular'
+    elif stability >= 0 and plasticity < 0:
+        return 'chill'
+    elif stability < 0 and plasticity >= 0:
+        return 'grumpy'
+    else:
+        return 'sad'
+
 def draw(env, ax):
     print(f"drawing: {len(env.spawner.humans)} humans, robot at {env.robot.pos}")
     ax.clear()
@@ -694,7 +709,8 @@ def draw(env, ax):
         orientation = agent.orientation if agent.orientation is not None else 0.0
         ps_front, ps_side = agent.ps_front, agent.ps_side
         color = BEHAVIOUR_COLORS.get(agent.behaviour_type, 'lightgray')
-        marker = PERSONALITY_MARKERS.get(agent.personality, 'o')
+        personality = get_personality(agent.stability, agent.plasticity)
+        marker = PERSONALITY_MARKERS.get(personality, 'o')
         poly_points = get_proxemic_polygon(x, y, orientation, ps_front, ps_side)
 
         dx = arrow_len * np.cos(orientation)

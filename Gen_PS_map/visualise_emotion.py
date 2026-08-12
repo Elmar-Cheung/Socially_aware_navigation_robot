@@ -13,7 +13,7 @@ import glob
 
 
 # Load environment
-env = SocialNavEnv(width=5, height=5, num_humans=2)
+env = SocialNavEnv(width=6, height=6, num_humans=2)
 
 model = SAC.load("C:/Users/Elmar/Desktop/MTP/All_models/Gen_PS_map/no_human", env=env)
 

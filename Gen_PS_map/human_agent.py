@@ -5,95 +5,88 @@ import random
 
 # Emotion reaction functions (carried over from Mesa version)
 # ------------------------------------------------------------------
+def norm_personality(val):
+    return (val + 3.0) / 6.0
 
-def violate_PS(personality, ps_violate, approach):
+def violate_PS(stability, ps_violate, approach):
+    # Depend on how close, but does not exceed collision reaction
     a = approach
-    x = 10.0 / ps_violate
-    match personality:
-        case 'regular':
-            return ((random.randint(-4, -1) / x) * a, (random.randint(1, 4) / x) * a)
-        case 'grumpy':
-            return ((random.randint(-7, -2) / x) * a, (random.randint(2, 7) / x) * a)
-        case 'sad':
-            return ((random.randint(-5, -2) / x) * a, (random.randint(2, 5) / x) * a)
-        case 'chill':
-            return ((random.randint(-3, -1) / x) * a, (random.randint(1, 3) / x) * a)
+    x = ps_violate / (ps_violate + 5.0)
+    stability = norm_personality(stability)
+    
+    trigger_prob = np.clip(0.5 - 0.2 * stability + 0.3 * x, 0.10, 0.90)
+    if random.random() < trigger_prob:
+        mag_scale = np.clip(1.0 - 0.3 * stability + 0.4 * x, 0.1, 1.5)
+        valence = random.uniform(-0.45, -0.30) * mag_scale * a
+        intensity = random.uniform(0.45, 0.55) * mag_scale * a
+        return True, (np.clip(valence, -1.0, 1.0), np.clip(intensity, 0.0, 1.0))
+    return False, (0.0, 0.0)
 
-
-def collision_reaction(personality, approach, Triggered_before):
-    a = approach
-    if Triggered_before:
-        a = a * 1.4
-    match personality:
-        case 'regular':
-            if random.random() < 0.3:
-                return True, ((random.randint(-4, -1) / 10) * a, (random.randint(1, 4) / 10) * a)
-            return False, (0.0, 0.0)
-        case 'grumpy':
-            if random.random() < 0.7:
-                return True, ((random.randint(-7, -2) / 10) * a, (random.randint(2, 7) / 10) * a)
-            return False, (0.0, 0.0)
-        case 'sad':
-            if random.random() < 0.6:
-                return True, ((random.randint(-5, -2) / 10) * a, (random.randint(2, 5) / 10) * a)
-            return False, (0.0, 0.0)
-        case 'chill':
-            if random.random() < 0.2:
-                return True, ((random.randint(-3, -1) / 10) * a, (random.randint(1, 3) / 10) * a)
-            return False, (0.0, 0.0)
-
-
-def disturb_group(personality, approach, Triggered_before):
+def collision_reaction(stability, approach, Triggered_before):
+    # high probability and high intensity
+    stability = norm_personality(stability)
     a = approach
     if Triggered_before:
         a = a * 1.4
-    match personality:
-        case 'regular':
-            if random.random() < 0.25:
-                return True, ((random.randint(-3, -2) / 10) * a, (random.randint(2, 3) / 10) * a)
-            return False, (0.0, 0.0)
-        case 'grumpy':
-            if random.random() < 0.5:
-                return True, ((random.randint(-6, -2) / 10) * a, (random.randint(2, 6) / 10) * a)
-            return False, (0.0, 0.0)
-        case 'sad':
-            if random.random() < 0.5:
-                return True, ((random.randint(-4, -2) / 10) * a, (random.randint(2, 4) / 10) * a)
-            return False, (0.0, 0.0)
-        case 'chill':
-            if random.random() < 0.2:
-                return True, ((random.randint(-2, -1) / 10) * a, (random.randint(1, 2) / 10) * a)
-            return False, (0.0, 0.0)
 
-def curious_reaction(personality, character, dist):
+    trigger_prob = np.clip(0.85 - 0.25 * stability, 0.40, 0.98)
+    if random.random() < trigger_prob:
+        mag_scale = np.clip(1.2 - 0.40 * stability, 0.70, 1.80)
+        valence = random.uniform(-0.65, -0.55) * mag_scale * a
+        intensity = random.uniform(0.65, 0.75) * mag_scale * a
+        return True, (np.clip(valence, -1.0, -0.01), np.clip(intensity, 0.0, 1.0))
+    return False, (0.0, 0.0)
+    
+def disturb_group(stability, approach, Triggered_before):
+    # low probability and low intensity
+    stability = norm_personality(stability)
+    a = approach
+    if Triggered_before:
+        a = a * 1.2
+
+    trigger_prob = np.clip(0.35 - 0.15 * stability, 0.05, 0.65)
+    if random.random() < trigger_prob:
+        mag_scale = np.clip(1.0 - 0.30 * stability, 0.5, 1.4)
+        valence = random.uniform(-0.30, -0.15) * mag_scale * a
+        intensity = random.uniform(0.25, 0.40) * mag_scale * a
+        return True, (np.clip(valence, -1.0, 1.0), np.clip(intensity, 0.0, 1.0))
+    return False, (0.0, 0.0)
+
+def curious_reaction(stability, plasticity):
     """First-encounter curiosity trigger."""
-    base_prob = {'extrovert': 0.7, 'mid': 0.4, 'introvert': 0.15}[character]
+    stability = norm_personality(stability)
+    plasticity = norm_personality(plasticity)
+
+    base_prob = np.clip(0.3 + 0.5 * plasticity, 0.10, 0.90)
     if random.random() > base_prob:
         return False, (0.0, 0.0)
-    # curiosity = positive valence, mild-moderate intensity, personality-scaled
-    intensity_range = {
-        'regular': (0.3, 0.6), 'grumpy': (0.1, 0.3),
-        'sad': (0.15, 0.35), 'chill': (0.4, 0.7),
-    }[personality]
-    valence = random.uniform(0.3, 0.7)
-    intensity = random.uniform(*intensity_range)
-    return True, (valence, intensity)
+    
+    mag_scale = np.clip(1.0 - 0.30 * stability + 0.2 * plasticity, 0.40, 1.6)
+    valence = random.uniform(0.25, 0.40) * mag_scale
+    intensity = random.uniform(0.20, 0.50) * mag_scale
+    return True, (np.clip(valence, -1.0, 1.0), np.clip(intensity, 0.0, 1.0))
 
+def startle_trigger(stability, plasticity, approach, dist_severity):
+    stability = norm_personality(stability)
+    plasticity = norm_personality(plasticity)
+    a = approach
 
-def startle_trigger(personality, character):
-    """
-    Sudden/fast robot approach trigger. Picks a physical reaction
-    (freeze-and-look vs. jolt-away) and the accompanying negative emotion.
-    """
-    freeze_prob = {'extrovert': 0.7, 'mid': 0.5, 'introvert': 0.3}[character]
-    reaction = 'freeze' if random.random() < freeze_prob else 'jolt'
-    intensity_range = {
-        'regular': (0.6, 0.85), 'grumpy': (0.75, 1.0),
-        'sad': (0.65, 0.9), 'chill': (0.4, 0.65),
-    }[personality]
-    valence = random.uniform(-0.9, -0.4)
-    intensity = random.uniform(*intensity_range)
-    return reaction, (valence, intensity)
+    # Determine if the reaction is freeze
+    pause_prob = np.clip(0.6 - 0.4 * plasticity - 0.2 * stability, 0.05, 0.95)
+    is_pause = random.random() < pause_prob
+    mag_base = 1.0 - 0.30 * stability + 0.4 * dist_severity
+    if is_pause:
+        mag_scale = np.clip(mag_base, 0.50, 1.8)
+        valence = random.uniform(-0.65, -0.55) * mag_scale * a
+        intensity = random.uniform(0.55, 0.65) * mag_scale * a
+        return 'freeze', (np.clip(valence, -1.0, 1.0), np.clip(intensity, 0.0, 1.0))
+    
+    jolt_mag_scale = np.clip(mag_base + 0.2, 0.6, 2.2)
+
+    valence = random.uniform(-0.60, -0.50) * jolt_mag_scale * a
+    intensity = random.uniform(0.65, 0.75) * jolt_mag_scale * a
+    return 'jolt', (np.clip(valence, -1.0, 1.0), np.clip(intensity, 0.0, 1.0))
+
 
 # HumanAgent
 # ------------------------------------------------------------------
@@ -115,27 +108,19 @@ class HumanAgent:
     # Startle response
     STARTLE_DIST_THRESHOLD  = 1.3    # metres — robot inside this range can startle
     STARTLE_SPEED_THRESHOLD = 0.6    # m/s — robot must be moving at least this fast
-    STARTLE_PROB = {'regular': 0.7, 'grumpy': 1.0, 'sad': 0.5, 'chill': 0.4}
-    STARTLE_BEHIND_MULT = 1.6 
     FREEZE_DURATION_RANGE = (8, 20)
     JOLT_DURATION_RANGE   = (3, 8)
-    JOLT_STRENGTH = {'regular': 1.3, 'grumpy': 1.8, 'sad': 1.5, 'chill': 1.0}
 
-    PERSONALITIES = ['regular', 'grumpy', 'sad', 'chill']
-    PER_PROBS     = [0.7, 0.05, 0.15, 0.1]
-    CHARACTERS    = ['extrovert', 'mid', 'introvert']
-    CHA_PROBS     = [0.25, 0.5, 0.25]
-    PAUSE_PROB = {'regular': 0.15, 'grumpy': 0.05, 'sad': 0.3, 'chill': 0.25}
-    PAUSE_CHARACTER_MULT = {'extrovert': 1.3, 'mid': 1.0, 'introvert': 0.7}
-
-    def __init__(self, pos, goal, group_id, group_size, speed, width, height):
+    def __init__(self, pos, goal, group_id, human_id, group_size, speed, width, height):
         self.prev_pos       = None
         self.pos            = np.array(pos,  dtype=np.float32)
         self.vel            = np.zeros(2,    dtype=np.float32)
         self.goal           = np.array(goal, dtype=np.float32)
         self.group_id       = group_id
+        self.human_id       = human_id
         self.group_size     = group_size
-        self.speed          = speed          # shared group speed
+        self.base_speed     = speed          # shared group speed
+        self.speed          = speed          # individual speed, updated to match group
         self.width          = width
         self.height         = height
 
@@ -150,8 +135,9 @@ class HumanAgent:
         self.pause_cooldown  = np.random.randint(50, 150)
         self.triggered_before = False
 
-        self.personality    = np.random.choice(self.PERSONALITIES, p=self.PER_PROBS)
-        self.character      = np.random.choice(self.CHARACTERS,    p=self.CHA_PROBS)
+        self.stability      = np.clip(np.random.normal(0.0, 1.0), -3, 3)
+        self.plasticity     = np.clip(np.random.normal(0.0, 1.0), -3, 3)
+
         self.behaviour_type = 'regular'
         self.emotion        = (0.0, 0.0)
         self.arrived        = False
@@ -161,30 +147,23 @@ class HumanAgent:
         self.prev_vel       = np.zeros(2, dtype=np.float32)
         self.startle_reaction  = None   # 'freeze' | 'jolt' | None
         self.startle_phys_timer = 0     # ticks left of physical override
-        self.init_ps_f, self.init_ps_s = self._get_personal_space_size(self.personality)
-        self.ps_front, self.ps_side = self.init_ps_f, self.init_ps_s
-
+        self.init_ps_f, self.init_ps_s, self.init_ps_b = self._get_personal_space_size()
+        self.ps_front, self.ps_side, self.ps_back = self.init_ps_f, self.init_ps_s, self.init_ps_b
+        self.temp_ps_f, self.temp_ps_s, self.temp_ps_b = self.ps_front, self.ps_side, self.ps_back
         # track speed change
         self.actual_speed = 0.0
-    def _get_personal_space_size(self, personality):
-        match personality:
-            case 'regular':
-                ps_front = np.random.uniform(1.0, 1.2)
-                ps_side = ps_front * 0.5
-                return ps_front, ps_side
-            case 'grumpy':
-                ps_front = np.random.uniform(1.2, 1.7)
-                ps_side = ps_front * 0.6
-                return ps_front, ps_side
-            case 'sad':
-                ps_front = np.random.uniform(0.9, 1.1)
-                ps_side = ps_front * 0.4
-                return ps_front, ps_side
-            case 'chill':
-                ps_front = np.random.uniform(0.8, 1.3)
-                ps_side = ps_front * 0.5
-                return ps_front, ps_side
-            
+
+    def _get_personal_space_size(self):
+        """
+        There is no widely agreed relationship between plasticity/stability with
+        personal space size. This is just for the convenience of the simulation.
+        Plasticity - primary driver for personal space size, stability - secondary driver.
+        """
+        ps_front = 1.0 - 0.1 * self.plasticity + 0.05 * self.stability + np.random.uniform(-0.1, 0.1)
+        ps_side = ps_front * 0.5 + np.random.uniform(-0.05, 0.05)
+        ps_back = ps_front * 0.5 + np.random.uniform(-0.1, 0.5)
+        return ps_front, ps_side, ps_back
+
 
     # Main step — called every simulation tick
     # ------------------------------------------------------------------
@@ -195,11 +174,23 @@ class HumanAgent:
         if self.prev_pos is not None and self.startle_reaction != 'freeze':
             self.orientation = np.arctan2(self.pos[1] - self.prev_pos[1], self.pos[0] - self.prev_pos[0])
 
-        self.prev_emotion = self.emotion
         self.prev_pos = self.pos
         self._update_behaviour(dt, other_humans, robot)
         self._apply_sfm(dt, other_humans, robot)
+        self._speed_scaled_ps()
         self._check_arrival()
+
+    # Impact of speed on the size of personal space
+    def _speed_scaled_ps(self):
+        # Gérin-Lajoie reference values at normal walking speed (~1.0-1.3 m/s)
+        front_ref = 2.0
+        side_ref  = 0.6
+        
+        speed_ratio = self.actual_speed / self.speed  # e.g. reference_speed = 1.2
+
+        self.ps_front = min(self.init_ps_f * front_ref * max(speed_ratio, 0.25), self.temp_ps_f)  # front stretches/shrinks with speed
+        self.ps_side  = min(self.init_ps_s * side_ref, self.temp_ps_s)   # side stays close to reference regardless of speed
+        self.ps_back  = min(self.init_ps_b * side_ref * max(1.0 - 0.5*speed_ratio, 0.1), self.temp_ps_b) 
 
 
     # Behaviour / emotion update
@@ -210,23 +201,26 @@ class HumanAgent:
             return False
         else:
             self.behaviour_type = 'collision'
-            self.triggered_before, self.emotion = collision_reaction(self.personality, approach, self.triggered_before)
+            self.triggered_before, self.emotion = collision_reaction(self.stability, approach, self.triggered_before)
             self.emotion_timer = np.random.randint(50, 100)
             return True
 
     def _check_startle(self, dt, other_humans, robot, robot_dist, trigger, approach, ps_violate):
-        if self._detect_startle(dt, robot):
+        dist_severity = np.clip(1.0 - robot_dist / self.STARTLE_DIST_THRESHOLD, 0.0, 1.0)
+        if self._detect_startle(dt, robot, dist_severity):
             self.behaviour_type = 'startled'
-            self.startle_reaction, self.emotion = startle_trigger(self.personality, self.character)
+            self.startle_reaction, self.emotion = startle_trigger(self.stability, self.plasticity, approach, dist_severity)
             self.emotion_timer = np.random.randint(40, 90)
+            duration_scale = np.clip(1.0 - 0.2 * self.stability, 0.4, 2.0)
             self.triggered_before = True
             if self.startle_reaction == 'freeze':
-                self.startle_phys_timer = np.random.randint(*self.FREEZE_DURATION_RANGE)
+                self.startle_phys_timer = np.random.randint(*self.FREEZE_DURATION_RANGE) * duration_scale
             else:
-                self.startle_phys_timer = np.random.randint(*self.JOLT_DURATION_RANGE)
+                self.startle_phys_timer = np.random.randint(*self.JOLT_DURATION_RANGE) * duration_scale
                 away = self.pos - robot.pos
                 away_dist = np.linalg.norm(away) + 1e-8
-                jolt_strength = self.JOLT_STRENGTH.get(self.personality, 1.3) * (0.6 + self.emotion[1])
+                mag_scale = np.clip(1.0 + 0.1 * self.plasticity, 0.7, 1.3)
+                jolt_strength = np.clip(1.0 + 0.1 * self.plasticity, 0.7, 1.3) * mag_scale * (0.6 + self.emotion[1])
                 self.vel = (away / away_dist) * jolt_strength
             return True
         else:
@@ -235,7 +229,7 @@ class HumanAgent:
     def _check_disturb_group(self, dt, other_humans, robot, robot_dist, trigger, approach, ps_violate):
         if self._robot_crosses_group(robot, other_humans):
             self.behaviour_type = 'disturb_group'
-            self.triggered_before, self.emotion = disturb_group(self.personality, approach, self.triggered_before)
+            self.triggered_before, self.emotion = disturb_group(self.stability, approach, self.triggered_before)
             self.emotion_timer = np.random.randint(30, 80)
             return True
         else:
@@ -244,7 +238,7 @@ class HumanAgent:
     def _check_curiosity(self, robot, robot_dist):
             if not self.met_robot and robot_dist < self.CURIOSITY_RANGE:
                 self.met_robot = True
-                triggered, self.emotion = curious_reaction(self.personality, self.character, robot_dist)
+                triggered, self.emotion = curious_reaction(self.stability, self.plasticity)
                 if triggered:
                     self.behaviour_type = 'curious'
                     self.emotion_timer = np.random.randint(40, 100)
@@ -254,7 +248,7 @@ class HumanAgent:
     def _check_violate_ps(self, dt, other_humans, robot, robot_dist, trigger, approach, ps_violate):
         if trigger:
             self.behaviour_type = 'violate_ps'
-            self.emotion = violate_PS(self.personality, ps_violate, approach)
+            self.triggered_before, self.emotion = violate_PS(self.stability, ps_violate, approach)
             self.emotion_timer = np.random.randint(20, 60)
             return True
         else:
@@ -268,17 +262,11 @@ class HumanAgent:
             self.emotion = (0.0, 0.0)
             self.emotion_timer = None
         else:
-            decay_rates = {
-                'regular':   0.02,   # slow recovery
-                'grumpy':    0.05,   # medium recovery
-                'sad':       0.035,
-                'chill':     0.10,   # fast recovery
-            }
-            decay_v = decay_rates.get(self.personality, 0.05)
-            decay_i = decay_v * 2
+            decay_rate = np.clip(0.05 + 0.015 * self.stability, 0.01, 0.1)
+            decay_i = decay_rate * 2
             current_valence = self.emotion[0]
             current_intensity = self.emotion[1]
-            new_valence = current_valence + decay_v * (0.1 - current_valence)
+            new_valence = current_valence + decay_rate * (0.1 - current_valence)
             new_intensity = current_intensity + decay_i * (0.1 - current_intensity)
             self.emotion = (new_valence, new_intensity)
         return
@@ -313,7 +301,7 @@ class HumanAgent:
         
         self.pause_cooldown -= 1
         if self.pause_cooldown <= 0:
-            prob = self.PAUSE_PROB.get(self.personality, 0.15) * self.PAUSE_CHARACTER_MULT.get(self.character, 1.0)
+            prob = 0.15 - 0.08 * self.plasticity - 0.04 * self.stability
             pause_triggered = random.random() < min(prob, 0.95)
             if pause_triggered:
                 self.pause_mode = 'decelerate'
@@ -353,7 +341,7 @@ class HumanAgent:
         local_x = dx_world * np.cos(self.orientation) + dy_world * np.sin(self.orientation)
         local_y = -dx_world * np.sin(self.orientation) + dy_world * np.cos(self.orientation)
 
-        sigma = self.ps_front if local_x >= 0 else self.ps_side
+        sigma = self.ps_front if local_x >= 0 else self.ps_back
         
         term_front = (local_x ** 2) / (2 * sigma ** 2)
         term_side = (local_y ** 2) / (2 * self.ps_side ** 2)
@@ -379,7 +367,7 @@ class HumanAgent:
         return ps_violate, trigger
         
 
-    def _detect_startle(self, dt, robot):
+    def _detect_startle(self, dt, robot, dist_severity):
         if robot.prev_pos is None or self.orientation is None:
             return False
 
@@ -401,9 +389,10 @@ class HumanAgent:
         dx_world = robot.pos[0] - self.pos[0]
         dy_world = robot.pos[1] - self.pos[1]
         local_x = dx_world * np.cos(self.orientation) + dy_world * np.sin(self.orientation)
-        behind_mult = self.STARTLE_BEHIND_MULT if local_x < 0 else 1.0
+        startle_scale = np.clip(1.0 + 0.1 * self.stability, 0.7, 1.3)
+        behind_mult = startle_scale if local_x < 0 else 1.0
 
-        prob = min(self.STARTLE_PROB.get(self.personality, 0.3) * behind_mult, 0.95)
+        prob = np.clip(0.5 - 0.15 * self.stability + 0.2 * dist_severity * behind_mult, 0.05, 0.95)
         return random.random() < prob
 
     def _robot_crosses_group(self, robot, other_humans):
@@ -482,7 +471,7 @@ class HumanAgent:
 
         self.vel  = self.vel + force * dt
         speed     = np.linalg.norm(self.vel)
-        max_speed = self.MAX_SPEED * (1.0 + valence * 0.3)  # upset humans rush
+        max_speed = self.MAX_SPEED * (1.0 + abs(valence) * 0.3)  # upset humans rush
         if speed > max_speed:
             self.vel = self.vel / speed * max_speed
         speed     = np.linalg.norm(self.vel)
@@ -524,26 +513,6 @@ class HumanAgent:
         magnitude = 0.8 * valence * intensity  # small relative to goal/repulsion forces
         return (diff / dist) * magnitude
 
-    WANDER_SCALE = {
-    'regular': 0.05,
-    'grumpy':  0.03,   # sharp, purposeful, less meander
-    'sad':     0.07,   # slightly more drifting/unfocused
-    'chill':   0.09,   # loose, relaxed wander
-    }
-
-    CHARACTER_WANDER_MULT = {
-        'extrovert': 1.3,  # more likely to drift/look around
-        'mid':       1.0,
-        'introvert': 0.7,  # more direct, head-down walking
-    }
-
-    SPEED_JITTER = {
-        'regular': 0.03,
-        'grumpy':  0.02,
-        'sad':     0.05,
-        'chill':   0.04,
-    }
-
     def _goal_force(self):
         diff = self.goal - self.pos
         dist = np.linalg.norm(diff)
@@ -551,8 +520,9 @@ class HumanAgent:
             return np.zeros(2, dtype=np.float32)
         direction = diff / dist
 
-        # --- heading noise: personality sets base wander, character scales it ---
-        wander = self.WANDER_SCALE[self.personality] * self.CHARACTER_WANDER_MULT[self.character]
+        wander_mult = np.clip(1.0 + 0.2 * self.plasticity, 0.7, 1.3)
+        wander_scale = np.clip(0.06 + 0.01 * self.stability, 0.03, 0.09)
+        wander = wander_scale * wander_mult
         noise_angle = np.random.normal(0, wander)
         c, s = np.cos(noise_angle), np.sin(noise_angle)
         direction = np.array([
@@ -560,20 +530,37 @@ class HumanAgent:
             direction[0] * s + direction[1] * c
         ], dtype=np.float32)
 
-        # --- speed noise: personality-scaled jitter around desired speed ---
-        speed_noise = np.random.normal(0, self.SPEED_JITTER[self.personality])
-        effective_speed = max(0.05, self.speed + speed_noise) * self.pause_speed_mult
+        speed_jitter = np.clip(0.03 + 0.01 * self.stability, 0.02, 0.05)
+        speed_noise = np.random.normal(0, speed_jitter)
+        effective_speed = max(0.05, self.base_speed + speed_noise) * self.pause_speed_mult
 
         desired_vel = direction * effective_speed
         return (desired_vel - self.vel) * self.GOAL_FORCE_STRENGTH
 
 
-    GROUP_DESIRED_DIST = 0.6   # comfortable side-by-side spacing
+    GROUP_DESIRED_DIST = 2.0   # comfortable side-by-side spacing
+    GROUP_SIDE_BIAS = 1.6 
 
     def _group_cohesion_force(self, other, dist, diff):
         delta = dist - self.GROUP_DESIRED_DIST
         magnitude = self.GROUP_FORCE_STRENGTH * np.tanh(delta / self.GROUP_FORCE_RANGE)
-        return (diff / dist) * magnitude   # sign falls out naturally, no threshold
+
+        base_dir = -diff / (dist * 0.8)   # attract when far, repel when close (sign fixed from before)
+
+        heading = self.goal - self.pos
+        hnorm = np.linalg.norm(heading)
+        if hnorm < 1e-6:
+            return base_dir * magnitude
+
+        heading_unit = heading / hnorm
+        
+        along = np.dot(base_dir, heading_unit) * heading_unit
+        lateral = base_dir - along
+
+        shaped_dir = lateral + along / self.GROUP_SIDE_BIAS
+        shaped_dir = shaped_dir / (np.linalg.norm(shaped_dir) + 1e-8)
+
+        return shaped_dir * magnitude
 
     def _group_force(self, other_humans):
         force = np.zeros(2, dtype=np.float32)
@@ -590,12 +577,20 @@ class HumanAgent:
     def _sync_group_speed(self, other_humans):
         mates = [h for h in other_humans if h.group_id == self.group_id]
         if not mates:
+            self.speed += (self.base_speed - self.speed) * 0.1
             return
-        group_actual_speeds = [h.actual_speed for h in mates + [self]]
-        # walk at the pace of the slowest member so the group doesn't shear apart
-        target = min(group_actual_speeds) if min(group_actual_speeds) > 0.05 else self.speed
-        self.speed += (target - self.speed) * 0.1   # smooth, not instant
-        
+
+        # a paused/startled mate has effective speed ~0 — the group should slow for them,
+        # not ignore them and speed back up
+        effective_speeds = [
+            0.0 if (h.pause_timer > 0 or h.startle_phys_timer > 0) else h.actual_speed
+            for h in mates
+        ]
+        slowest = min(effective_speeds)
+        target = slowest if slowest > 0.05 else self.base_speed * 0.05  # near-stop, not full base_speed
+
+        self.speed += (target - self.speed) * 0.1
+
     def _social_force_humans(self, other_humans):
         """Repulsion from other humans."""
         force = np.zeros(2, dtype=np.float32)
@@ -620,13 +615,15 @@ class HumanAgent:
             if 0 < dist < self.SOCIAL_FORCE_RANGE:
                 magnitude = self.SOCIAL_FORCE_STRENGTH * np.exp(-dist / self.SOCIAL_FORCE_RANGE)
                 force += (diff / dist) * magnitude
-        avg_dist = (close_dist1 + close_dist2) / 2.0
+        avg_intimate_dist = (2.4 - close_dist1 - close_dist2) / 2.0
         if count >= 2:
-            self.ps_front = np.clip(self.init_ps_f * avg_dist, 0.3, self.init_ps_f)
-            self.ps_side  = np.clip(self.init_ps_s * avg_dist, 0.15, self.init_ps_s)
+            self.temp_ps_f = np.clip(self.init_ps_f * avg_intimate_dist, 0.3, self.init_ps_f)
+            self.temp_ps_s  = np.clip(self.init_ps_s * avg_intimate_dist, 0.15, self.init_ps_s)
+            self.temp_ps_b  = np.clip(self.init_ps_b * avg_intimate_dist, 0.15, self.init_ps_b)
         else:
-            self.ps_front = self.init_ps_f
-            self.ps_side  = self.init_ps_s
+            self.temp_ps_f = self.init_ps_f
+            self.temp_ps_s  = self.init_ps_s
+            self.temp_ps_b  = self.init_ps_b
         return force
 
     def _social_force_robot(self, robot):
@@ -647,7 +644,7 @@ class HumanAgent:
         Strong repulsion from walls, strongest of all 
         """
         force     = np.zeros(2, dtype=np.float32)
-        margin    = 0.1
+        margin    = 0.2
         strength  = 10.0
 
         if self.pos[0] < margin:
@@ -700,15 +697,17 @@ class HumanAgent:
         Returns a 6-element list matching the observation format:
         [pos_x, pos_y, speed, valence, intensity, prev_valence, prev_intensity]
         """
-        valence        = self.emotion[0]      if self.emotion      else 0.0
-        intensity      = self.emotion[1]      if self.emotion      else 0.0
-        orientation    = self.orientation     if self.orientation  else 0.0
-        speed          = self.actual_speed      if self.actual_speed  else 0.0
+        valence     = self.emotion[0]      if self.emotion      else 0.0
+        intensity   = self.emotion[1]      if self.emotion      else 0.0
+        orientation = self.orientation     if self.orientation  else 0.0
+        speed       = self.actual_speed    if self.actual_speed else 0.0
+        human_id    = self.human_id        if self.human_id     else 0.0
         return [
             float(self.pos[0]),
             float(self.pos[1]),
             float(valence),
             float(intensity),
             float(orientation),
-            float(speed)
+            float(speed),
+            float(human_id)
         ]

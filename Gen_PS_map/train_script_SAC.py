@@ -35,10 +35,10 @@ wandb.init(
     ),
     config={
         "algorithm": "SAC",
-        "total_timesteps": 100000,
-        "num_humans": 1,
-        "width": 10,
-        "height": 10,
+        "total_timesteps": 50000,
+        "num_humans": 2,
+        "width": 6,
+        "height": 6,
     }
 )
 
@@ -58,7 +58,10 @@ class WandbCallback(BaseCallback):
             'orientation':      self.locals['infos'][0].get('orientation', 0),
             'orientation_unwrapped': self.locals['infos'][0].get('orientation_unwrapped', 0),
             'speed':            self.locals['infos'][0].get('speed', 0),
-            'arrive':           self.locals['infos'][0].get('human_arrived', 0)
+            'arrive':           self.locals['infos'][0].get('human_arrived', 0),
+            'episode_step':     self.locals['infos'][0].get('episode_step', 0),
+            'avg_pen':     self.locals['infos'][0].get('avg_pen', 0),
+            'avg_trigger':     self.locals['infos'][0].get('avg_trigger', 0),
         })
         return True
     
@@ -82,7 +85,7 @@ os.makedirs(os.path.join(BASE_DIR, "checkpoints"), exist_ok=True)
 # --- Initialization ---
 # Initialize wandb directly in the main thread execution context
 
-env = SocialNavEnv(width=5, height=5, num_humans=2)
+env = SocialNavEnv(width=6, height=6, num_humans=2)
 
 model = SAC(
     "MultiInputPolicy", env,
@@ -92,7 +95,7 @@ model = SAC(
     tensorboard_log=os.path.join(BASE_DIR, "tensorboard_logs"),
     learning_rate=3e-4,
     buffer_size=50000,
-    learning_starts=1000,
+    learning_starts=5000,
     train_freq=1,
     gradient_steps=1,
     tau=0.005,
@@ -108,7 +111,7 @@ checkpoint = CheckpointCallback(
 )
 
 # --- Training Loop ---
-model.learn(total_timesteps=10000, callback=[checkpoint, WandbCallback()])
+model.learn(total_timesteps=50000, callback=[checkpoint, WandbCallback()])
 
 # --- Secure Shutdown and Save ---
 print("Training finished. Safely synchronizing and closing W&B threads...")

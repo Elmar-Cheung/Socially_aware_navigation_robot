@@ -85,7 +85,7 @@ class Robot:
     # Observation
     # ------------------------------------------------------------------
 
-    def get_observation(self, humans, radius=2.5, top_n=1):
+    def get_observation(self, humans, radius=2.5, top_n=2):
         nearby = [
             h for h in humans
             if np.linalg.norm(h.pos - self.pos) <= radius
@@ -99,7 +99,7 @@ class Robot:
 
         # Pad to top_n rows
         while len(data) < top_n:
-            data.append([0.0] * 6)
+            data.append([0.0] * 7)
 
         return np.array(data, dtype=np.float32)
 

@@ -21,6 +21,12 @@ from stable_baselines3.common.callbacks import BaseCallback
 
 from stable_baselines3.common.buffers import DictReplayBuffer
 
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import r2_score
+
+import pandas as pd
+
 class HumanOnlyReplayBuffer(DictReplayBuffer):
     def add(self, obs, next_obs, action, reward, done, infos):
         if not any(info.get("human_nearby", False) for info in infos):
@@ -45,20 +51,11 @@ class GroupSpawner:
         self.spawn_queue = deque()      # queued group sizes to spawn
         self.remaining = num_humans     # humans yet to be spawned
         self.group_id_counter = 0
+        self.human_id_counter = 0
 
         self._fill_spawn_queue()
 
     def try_spawn(self):
-        # Force respawn if population drops too low"
-        """
-        if len(self.humans) < 15 and not self.spawn_queue:
-            self.remaining += 10
-            self._fill_spawn_queue()
-        
-        if len(self.humans) > 35:
-            self.remaining -= 10
-            self._fill_spawn_queue()
-        """
 
         while self.spawn_queue:
             group_size = self.spawn_queue[0]
@@ -169,6 +166,8 @@ class GroupSpawner:
 
         group_id = self.group_id_counter
         self.group_id_counter += 1
+        human_id = self.human_id_counter
+        self.human_id_counter += 1
 
         speed = random.uniform(0.5, 1.5)  # shared group speed
         goal = self._assign_group_goal(positions[0], group_size)
@@ -179,6 +178,7 @@ class GroupSpawner:
                 pos=pos.copy(),
                 goal=goal.copy(),
                 group_id=group_id,
+                human_id=human_id,
                 group_size=group_size,
                 speed=speed,
                 width=self.width,
@@ -196,7 +196,7 @@ class GroupSpawner:
         Assigns a goal on the opposite side of spawn location.
         """
         x, y = float(spawn_pos[0]), float(spawn_pos[1])
-        margin = 0.2
+        margin = 0.4
 
         # Determine which edge the group spawned on
         left   = x < self.width * 0.1
@@ -241,20 +241,27 @@ class SocialNavEnv(gym.Env):
         self.num_humans = num_humans
         self.action = None
         self.couter = 0
-        self.check_frequ = 1000
-        self.obs_buffer = deque(maxlen=1000)
+        self.check_frequ = 5000
+        self.obs_buffer = deque(maxlen=5000)
         self.safety_trigger = False
         self._human_detected = False
         self.observation_space = gym.spaces.Dict({
             'agents': gym.spaces.Box(
                 low=-50, high=50,
-                shape=(1, 7), dtype=np.float32
+                shape=(2, 8), dtype=np.float32
             )
         })
 
         self._prev_raw_orientation = None
         self._unwrap_offset = 0.0
         self.h_arrived = 0
+
+        self.move_dist = 0.0
+
+        self.current_step = 0
+        self.max_steps = 500
+        self.cascade_pen = 0
+        self.trigger_count = 0
 
         self.robot = Robot(self.width, self.height)
         self.spawner = GroupSpawner(self.width, self.height, self.num_humans)
@@ -265,22 +272,71 @@ class SocialNavEnv(gym.Env):
         # Small action space - velocity commands
         self.action_space = gym.spaces.Box(
             low=0, high=3.0,
-            shape=(1, 3), dtype=np.float32
+            shape=(2, 3), dtype=np.float32
         )
     
     def _get_obs(self):
         obs = self.robot.get_observation(self.spawner.humans)
         self._human_detected = len(obs) > 0
-        agent_matrix = np.zeros((1, 7), dtype=np.float32)
+        agent_matrix = np.zeros((2, 8), dtype=np.float32)
         for i, human in enumerate(obs[:1]):
             rel_x       = human[0] - self.robot.pos[0]
             rel_y       = human[1] - self.robot.pos[1]
-            valence     = human[2]
-            intensity   = human[3]
-            orientation = human[4]
+            true_valence     = human[2]
+            true_intensity   = human[3]
+            world_frame_orientation = human[4]
+
+            # Convert the orientation from world frame to robot relative orientation
+            target_orientation = np.arctan2(-rel_y, -rel_x)
+            orientation = target_orientation - world_frame_orientation
+            orientation = np.arctan2(np.sin(orientation), np.cos(orientation))
+
+            # Add noise and uncertainty to observed valence and intensity
+            # Typical acuracy of SOTA emotion recognition algorithm is about 60 - 75%
+            abs_deg = np.degrees(abs(orientation))
+            if abs_deg <= 30.0:
+                accuracy_chance = 0.65
+                jitter_range = 0.15
+            elif abs_deg <= 75.0:
+                factor = (abs_deg - 60.0) / 45.0
+                accuracy_chance = 0.65 - (factor * 0.45)
+                jitter_range = 0.15 + (factor * 0.1)
+            else:
+                accuracy_chance = 0.0
+                jitter_range = 0.0
+
+            if abs(true_valence) != 0.0 and abs_deg <= 75.0:
+                if random.random() < accuracy_chance:
+                    # Accurate detection
+                    # There might be a 10 - 15% jitter
+                    v_jitter = random.uniform(-jitter_range, jitter_range)
+                    i_jitter = random.uniform(-jitter_range, jitter_range)
+
+                    valence = true_valence + v_jitter
+                    intensity = true_intensity + i_jitter
+                else:
+                    # made the wrong detection
+                    if abs(true_valence) <= 0.7:
+                        valence = random.uniform(-0.2, 0.2)
+                        intensity = random.uniform(0.0, 0.3)
+                    else:
+                        v_jitter = random.uniform(-jitter_range, jitter_range)
+                        i_jitter = random.uniform(-jitter_range, jitter_range)
+                        
+                        valence = -true_valence + v_jitter
+                        intensity = true_intensity + i_jitter    
+
+                valence = np.clip(valence, -1.0, 1.0)
+                intensity = np.clip(intensity, 0.0, 1.0)  
+                           
+            else:
+                valence = 0.0
+                intensity = 0.0
+
             speed       = human[5]
+            human_id    = human[6]
             dist        = np.sqrt(rel_x**2 + rel_y**2)
-            agent_matrix[i] = [rel_x, rel_y, orientation, speed, dist, valence, intensity]
+            agent_matrix[i] = [rel_x, rel_y, orientation, speed, dist, valence, intensity, human_id]
 
         gx, gy = self.robot.goal if self.robot.goal is not None else self.robot.pos
 
@@ -290,7 +346,7 @@ class SocialNavEnv(gym.Env):
 
         return {'agents': agent_matrix}
 
-    def _get_info(self):
+    def _get_info(self, num_step, avg_pen, avg_safety_trigger):
         gx, gy = self.robot.goal if self.robot.goal is not None else self.robot.pos
         goal = self.robot.goal if self.robot.goal is not None else self.robot.pos
         human_matrix = self._get_obs()["agents"]
@@ -303,12 +359,15 @@ class SocialNavEnv(gym.Env):
             'time_used':     self.robot.time_stamp,
             'tot_soc_pen':   self.tot_soc_pen,
             'social_reward': self.social_reward,
-            'collision_reward': self.collision_reward,
+            'move_reward':   self.move_reward,
             'human_nearby':  self._human_detected,
-            'orientation':            raw,
+            'orientation':   raw,
             'orientation_unwrapped':  self._live_unwrap(raw),
             'speed':         human_matrix[0, 3],
             'human_arrived': self.h_arrived,
+            'episode_step' : num_step,
+            'avg_pen':       avg_pen,
+            'avg_trigger':   avg_safety_trigger,
         }
 
     def _live_unwrap(self, raw):
@@ -328,19 +387,21 @@ class SocialNavEnv(gym.Env):
         reward = 0.0
         self.tot_soc_pen = 0.0
         self.social_reward = 0.0
+        self.move_reward = 0.0
         human_matrix = obs["agents"]
 
         if self.safety_trigger:
-            reward -= 5.0
-            self.tot_soc_pen -= 5.0
+            reward -= 1.0
+            self.move_reward -= 1.0
             self.safety_trigger = False
-            self.social_reward -= 5.0
+            self.trigger_count += 1
 
         for i in range(len(human_matrix)):
-            _, _, _, _, _, valence, intensity = human_matrix[i]
+            _, _, _, _, _, valence, intensity, _ = human_matrix[i]
             reward += valence * intensity * 5.0
             self.tot_soc_pen += valence * intensity * 5.0
 
+        self.cascade_pen += self.tot_soc_pen
 
         return reward
 
@@ -349,12 +410,18 @@ class SocialNavEnv(gym.Env):
         super().reset(seed=seed)
         self.robot.time_stamp = 0
         self._prev_dist = np.linalg.norm(self.robot.pos - self.robot.goal)
-        print(self.action)
-        return self._get_obs(), self._get_info()
+        return self._get_obs(), self._get_info(num_step=0, avg_pen=0, avg_safety_trigger=0)
 
     def step(self, action):
+        terminate = False
+        truncate = False
+        num_step = 0
+        avg_safety_trigger = 0
+        avg_pen = 0
+
         self.obs_buffer.append(np.concatenate((self._get_obs()["agents"].flatten(), np.array(self.rel_goal_pos, dtype=np.float32))))
         self.couter += 1
+
         if len(self.obs_buffer) == self.obs_buffer.maxlen and (self.couter % self.check_frequ == 0):
             buffer = np.array(self.obs_buffer)
 
@@ -371,31 +438,63 @@ class SocialNavEnv(gym.Env):
             z_v = v_and_i_mean / v_std
 
             cross_corr_matrix = np.dot(z_o.T, z_v) / len(self.obs_buffer)
+            print("Linear Correlation:", cross_corr_matrix)
+            features = ['rel_x', 'rel_y', 'orientation', 'speed', 'dist']
+            X = buffer[:, 0:5]
+            y_valence = buffer[:, 5]
+            y_intensity = buffer[:, 6]
+
+            # If you can identify episode boundaries, split whole episodes into train/test
+            n = len(X)
+            split_idx = int(n * 0.8)
+
+            X_train, X_test = X[:split_idx], X[split_idx:]
+            yv_train, yv_test = y_valence[:split_idx], y_valence[split_idx:]
+            yi_train, yi_test = y_intensity[:split_idx], y_intensity[split_idx:]
             
-            print(cross_corr_matrix)
+            model_valence = RandomForestRegressor(n_estimators=200, random_state=0).fit(X_train, yv_train)
+            print("Valence R^2:", r2_score(yv_test, model_valence.predict(X_test)))
+            X_train, X_test, yi_train, yi_test = train_test_split(X, y_intensity, test_size=0.2, random_state=0)
+            model_intensity = RandomForestRegressor(n_estimators=200, random_state=0).fit(X_train, yi_train)
+            print("Intensity R^2:", r2_score(yi_test, model_intensity.predict(X_test)))
+            importances = pd.Series(model_valence.feature_importances_, index=features)
+            print(importances.sort_values(ascending=False))
 
         self.action = action
         self.spawner.try_spawn()
 
         obs = self._get_obs()
         movement = self._get_movement(obs, action, self.rel_goal_pos)
-
+        prev_pos = self.robot.pos.copy()
         arrived = self.robot.step(movement, self.dt)
+        current_pos = self.robot.pos.copy()
+        self.move_dist = np.linalg.norm(current_pos - prev_pos)
 
         for human in self.spawner.humans:
             human.step(self.dt, self.spawner.humans, self.robot)
             if human.arrived:
-                self.h_arrived = 1
                 self.spawner.check_group_arrived(human.group_id)
-            else:
-                self.h_arrived = 0
         
         obs    = self._get_obs()
         reward = self._get_reward(obs)
 
-        terminate = arrived
-        
-        return obs, reward, terminate, False, self._get_info()
+        if arrived:
+            terminate = True
+            num_step = self.current_step
+            self.current_step = 0
+            avg_pen = self.cascade_pen / num_step
+            avg_safety_trigger = self.trigger_count / num_step
+            self.cascade_pen = 0
+            self.trigger_count = 0
+
+        if self.current_step >= self.max_steps:
+            num_step = self.current_step
+            self.current_step = 0
+            truncate = True
+        self.current_step += 1
+
+        return obs, reward, terminate, truncate, self._get_info(num_step, avg_pen, avg_safety_trigger)
+
 
     def _get_movement(self, obs, action, rel_goal, map_size=5.0, resolution=0.025, robot_radius=0.3):
         human_matrix = obs["agents"]
@@ -423,7 +522,7 @@ class SocialNavEnv(gym.Env):
         y_local = valid_human[:, 1]
         ori     = valid_human[:, 2]
         vel     = valid_human[:, 3]
-        d_dist    = self.dt * vel
+        d_dist    = self.dt * vel * 2.0
         x_next  = x_local + d_dist * np.cos(ori)
         y_next  = y_local + d_dist * np.sin(ori)
 
@@ -451,7 +550,11 @@ class SocialNavEnv(gym.Env):
                 
         phi = np.ones((grid_cells, grid_cells), dtype=np.float32)
         phi[goal_y_idx, goal_x_idx] = -1.0 # Prevents robot staying stationary
+
         """
+        This section is for later on if I want to add more data to replay buffer
+        this is commmented out for now as its not complete.
+
         if len(valid_human) >= 2:
             # gather more human data(ish)
             r_matrix = np.zeros((5, grid_cells, grid_cells), dtype=np.float32)
@@ -687,6 +790,16 @@ PERSONALITY_MARKERS = {
     'chill':   'D',
 }
 
+def get_personality(stability, plasticity):
+    if stability >= 0 and plasticity >= 0:
+        return 'regular'
+    elif stability >= 0 and plasticity < 0:
+        return 'chill'
+    elif stability < 0 and plasticity >= 0:
+        return 'grumpy'
+    else:
+        return 'sad'
+
 def draw(env, ax):
     print(f"drawing: {len(env.spawner.humans)} humans, robot at {env.robot.pos}")
     ax.clear()
@@ -704,7 +817,8 @@ def draw(env, ax):
         orientation = agent.orientation if agent.orientation is not None else 0.0
         ps_front, ps_side = agent.ps_front, agent.ps_side
         color = BEHAVIOUR_COLORS.get(agent.behaviour_type, 'lightgray')
-        marker = PERSONALITY_MARKERS.get(agent.personality, 'o')
+        personality = get_personality(agent.stability, agent.plasticity)
+        marker = PERSONALITY_MARKERS.get(personality, 'o')
         poly_points = get_proxemic_polygon(x, y, orientation, ps_front, ps_side)
 
         dx = arrow_len * np.cos(orientation)
