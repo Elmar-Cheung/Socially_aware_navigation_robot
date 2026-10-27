@@ -4,6 +4,12 @@ venv/
 env/
 ENV/
 
+ps_tracking/
+trap_debug/
+wandb/
+checkpoints/
+results/
+
 # Python cache
 __pycache__/
 *.pyc
@@ -37,3 +43,5 @@ outputs/
 .DS_Store
 .vscode/
 .idea/
+
+*.csv

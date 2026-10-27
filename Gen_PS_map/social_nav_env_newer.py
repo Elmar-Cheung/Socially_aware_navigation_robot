@@ -18,7 +18,14 @@ from matplotlib.animation import FuncAnimation
 
 import skfmm
 from stable_baselines3.common.callbacks import BaseCallback
+
 from stable_baselines3.common.buffers import DictReplayBuffer
+
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import r2_score
+
+import pandas as pd
 
 class HumanOnlyReplayBuffer(DictReplayBuffer):
     def add(self, obs, next_obs, action, reward, done, infos):
@@ -44,21 +51,11 @@ class GroupSpawner:
         self.spawn_queue = deque()      # queued group sizes to spawn
         self.remaining = num_humans     # humans yet to be spawned
         self.group_id_counter = 0
-        self.human_id_counter = 0
+        self.human_id_counter = 1
 
         self._fill_spawn_queue()
 
     def try_spawn(self):
-        # Force respawn if population drops too low"
-        """
-        if len(self.humans) < 15 and not self.spawn_queue:
-            self.remaining += 10
-            self._fill_spawn_queue()
-        
-        if len(self.humans) > 35:
-            self.remaining -= 10
-            self._fill_spawn_queue()
-        """
 
         while self.spawn_queue:
             group_size = self.spawn_queue[0]
@@ -81,17 +78,6 @@ class GroupSpawner:
                 member.goal = new_goal.copy()
                 member.arrived = False
 
-    def get_nearby_humans(self, pos, radius=4.0, top_n=10):
-        """
-        Find the closest humans around robot
-        """
-        in_radius = [
-            h for h in self.humans
-            if np.linalg.norm(h.pos - pos) <= radius
-        ]
-        in_radius.sort(key=lambda h: np.linalg.norm(h.pos - pos))
-        return in_radius[:top_n]
-
     def _fill_spawn_queue(self):
         while self.remaining > 0:
             is_group = random.random() < 0.2
@@ -104,6 +90,7 @@ class GroupSpawner:
             group_size = self.remaining
             self.spawn_queue.append(group_size)
             self.remaining -= group_size
+
 
     def _find_free_edge_positions(self, group_size, min_separation=1.5):
         """
@@ -168,13 +155,13 @@ class GroupSpawner:
 
         group_id = self.group_id_counter
         self.group_id_counter += 1
-        human_id = self.human_id_counter
-        self.human_id_counter += 1
+
         speed = random.uniform(0.5, 1.5)  # shared group speed
         goal = self._assign_group_goal(positions[0], group_size)
         members = []
 
         for pos in positions:
+            human_id = self.human_id_counter
             human = HumanAgent(
                 pos=pos.copy(),
                 goal=goal.copy(),
@@ -185,6 +172,7 @@ class GroupSpawner:
                 width=self.width,
                 height=self.height
             )
+            self.human_id_counter += 1
             self.humans.append(human)
             members.append(human)
 
@@ -242,28 +230,42 @@ class SocialNavEnv(gym.Env):
         self.num_humans = num_humans
         self.action = None
         self.couter = 0
-        self.check_frequ = 1000
-        self.obs_buffer = deque(maxlen=1000)
+        self.check_frequ = 5000
+        self.obs_buffer = deque(maxlen=5000)
         self.safety_trigger = False
         self._human_detected = False
+
         self.observation_space = gym.spaces.Dict({
             'agents': gym.spaces.Box(
                 low=-50, high=50,
-                shape=(2, 5), dtype=np.float32
-            )
+                shape=(2, 8), dtype=np.float32
+            ),
         })
 
         self._prev_raw_orientation = None
         self._unwrap_offset = 0.0
         self.h_arrived = 0
 
+        self.move_dist = 0.0
+
+        self.current_step = 0
+        self.max_steps = 500
+        self.cascade_pen = 0
+        self.trigger_count = 0
+        self.min_human_dist = 1000.0
+        self.cascade_val = 0.0
+        self.cascade_int = 0.0
+        self.human_interaction = 0
+
+        self.feasible_mask = None
+        self.feasible_grid_x = None   # shift local grid to world coords
+        self.feasible_grid_y = None
+
         self.robot = Robot(self.width, self.height)
         self.spawner = GroupSpawner(self.width, self.height, self.num_humans)
         for _ in range(10):
             self.spawner.try_spawn()
-        self._prev_dist = np.linalg.norm(self.robot.pos - self.robot.goal)
-        self.previous_reward = 0.0
-        # Small action space - velocity commands
+
         self.action_space = gym.spaces.Box(
             low=0, high=3.0,
             shape=(2, 3), dtype=np.float32
@@ -272,14 +274,71 @@ class SocialNavEnv(gym.Env):
     def _get_obs(self):
         obs = self.robot.get_observation(self.spawner.humans)
         self._human_detected = len(obs) > 0
-        agent_matrix = np.zeros((2, 5), dtype=np.float32)
-        for i, human in enumerate(obs[:1]):
-            rel_x       = human[0] - self.robot.pos[0]
-            rel_y       = human[1] - self.robot.pos[1]
-            orientation = human[4]
-            speed       = human[5]
-            dist        = np.sqrt(rel_x**2 + rel_y**2)
-            agent_matrix[i] = [rel_x, rel_y, orientation, speed, dist]
+        agent_matrix = np.zeros((2, 8), dtype=np.float32)
+        for i, human in enumerate(obs[:2]):
+            if human[6] != 0.0:
+                rel_x       = human[0] - self.robot.pos[0]
+                rel_y       = human[1] - self.robot.pos[1]
+                true_valence     = human[2]
+                true_intensity   = human[3]
+                world_frame_orientation = human[4]
+
+                # Convert the orientation from world frame to robot relative orientation
+                target_orientation = np.arctan2(-rel_y, -rel_x)
+                orientation = target_orientation - world_frame_orientation
+                orientation = np.arctan2(np.sin(orientation), np.cos(orientation))
+
+                # Add noise and uncertainty to observed valence and intensity
+                # Typical acuracy of SOTA emotion recognition algorithm is about 60 - 75%
+                abs_deg = np.degrees(abs(orientation))
+                if abs_deg <= 30.0:
+                    accuracy_chance = 0.65
+                    jitter_range = 0.15
+                elif abs_deg <= 75.0:
+                    factor = (abs_deg - 60.0) / 45.0
+                    accuracy_chance = 0.65 - (factor * 0.45)
+                    jitter_range = 0.15 + (factor * 0.1)
+                else:
+                    accuracy_chance = 0.0
+                    jitter_range = 0.0
+
+                if abs(true_valence) != 0.0 and abs_deg <= 75.0:
+                    if random.random() < accuracy_chance:
+                        # Accurate detection
+                        # There might be a 10 - 15% jitter
+                        v_jitter = random.uniform(-jitter_range, jitter_range)
+                        i_jitter = random.uniform(-jitter_range, jitter_range)
+
+                        valence = true_valence + v_jitter
+                        intensity = true_intensity + i_jitter
+                    else:
+                        # made the wrong detection
+                        if abs(true_valence) <= 0.7:
+                            valence = random.uniform(-0.2, 0.2)
+                            intensity = random.uniform(0.0, 0.3)
+                        else:
+                            v_jitter = random.uniform(-jitter_range, jitter_range)
+                            i_jitter = random.uniform(-jitter_range, jitter_range)
+                            
+                            valence = -true_valence + v_jitter
+                            intensity = true_intensity + i_jitter    
+
+                    valence = np.clip(valence, -1.0, 1.0)
+                    intensity = np.clip(intensity, 0.0, 1.0)  
+                            
+                else:
+                    valence = 0.0
+                    intensity = 0.0
+
+                speed       = human[5]
+                human_id    = human[6]
+                dist        = np.sqrt(rel_x**2 + rel_y**2)
+                self.human_interaction += 1
+                if dist < self.min_human_dist:
+                    self.min_human_dist = dist
+                agent_matrix[i] = [rel_x, rel_y, orientation, speed, dist, valence, intensity, human_id]
+            else:
+                agent_matrix[i] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 
         gx, gy = self.robot.goal if self.robot.goal is not None else self.robot.pos
 
@@ -289,7 +348,7 @@ class SocialNavEnv(gym.Env):
 
         return {'agents': agent_matrix}
 
-    def _get_info(self):
+    def _get_info(self, num_step, avg_pen, avg_safety_trigger):
         gx, gy = self.robot.goal if self.robot.goal is not None else self.robot.pos
         goal = self.robot.goal if self.robot.goal is not None else self.robot.pos
         human_matrix = self._get_obs()["agents"]
@@ -302,12 +361,15 @@ class SocialNavEnv(gym.Env):
             'time_used':     self.robot.time_stamp,
             'tot_soc_pen':   self.tot_soc_pen,
             'social_reward': self.social_reward,
-            'collision_reward': self.collision_reward,
+            'move_reward':   self.move_reward,
             'human_nearby':  self._human_detected,
-            'orientation':            raw,
+            'orientation':   raw,
             'orientation_unwrapped':  self._live_unwrap(raw),
-            'speed':         human_matrix[0, 3] if len(human_matrix) > 0 else 0.0,
+            'speed':         human_matrix[0, 3],
             'human_arrived': self.h_arrived,
+            'episode_step' : num_step,
+            'avg_pen':       avg_pen,
+            'avg_trigger':   avg_safety_trigger,
         }
 
     def _live_unwrap(self, raw):
@@ -326,16 +388,25 @@ class SocialNavEnv(gym.Env):
     def _get_reward(self, obs):
         reward = 0.0
         self.tot_soc_pen = 0.0
+        self.social_reward = 0.0
+        self.move_reward = 0.0
         human_matrix = obs["agents"]
 
-        comfort_dist = 1.5   # personal-space radius you're willing to tune
-        penalty_weight = 5.0
+        if self.safety_trigger:
+            reward -= 1.0
+            self.move_reward -= 1.0
+            self.safety_trigger = False
+            self.trigger_count += 1
 
         for i in range(len(human_matrix)):
-            _, _, _, _, dist = human_matrix[i]
-            if dist < comfort_dist:
-                reward -= penalty_weight * (comfort_dist - dist) / comfort_dist
-                self.tot_soc_pen -= penalty_weight * (comfort_dist - dist) / comfort_dist
+            _, _, _, _, _, valence, intensity, _ = human_matrix[i]
+            reward += valence * intensity * 5.0
+            self.tot_soc_pen += valence * intensity * 5.0
+            if valence < 0:
+                self.cascade_int += intensity
+                self.cascade_val += valence
+
+        self.cascade_pen += self.tot_soc_pen
 
         return reward
 
@@ -343,13 +414,25 @@ class SocialNavEnv(gym.Env):
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
         self.robot.time_stamp = 0
-        self._prev_dist = np.linalg.norm(self.robot.pos - self.robot.goal)
-        print(self.action)
-        return self._get_obs(), self._get_info()
+        self.human_interaction = 0
+        self.cascade_pen = 0
+        self.trigger_count = 0
+        self.min_human_dist = 1000.0
+        self.cascade_int = 0.0
+        self.cascade_val = 0.0
+        self.current_step = 0
+        return self._get_obs(), self._get_info(num_step=0, avg_pen=0, avg_safety_trigger=0)
 
     def step(self, action):
+        terminate = False
+        truncate = False
+        num_step = 0
+        avg_safety_trigger = 0
+        avg_pen = 0
+
         self.obs_buffer.append(np.concatenate((self._get_obs()["agents"].flatten(), np.array(self.rel_goal_pos, dtype=np.float32))))
         self.couter += 1
+
         if len(self.obs_buffer) == self.obs_buffer.maxlen and (self.couter % self.check_frequ == 0):
             buffer = np.array(self.obs_buffer)
 
@@ -366,36 +449,67 @@ class SocialNavEnv(gym.Env):
             z_v = v_and_i_mean / v_std
 
             cross_corr_matrix = np.dot(z_o.T, z_v) / len(self.obs_buffer)
+            print("Linear Correlation:", cross_corr_matrix)
+            features = ['rel_x', 'rel_y', 'orientation', 'speed', 'dist']
+            X = buffer[:, 0:5]
+            y_valence = buffer[:, 5]
+            y_intensity = buffer[:, 6]
+
+            # If you can identify episode boundaries, split whole episodes into train/test
+            n = len(X)
+            split_idx = int(n * 0.8)
+
+            X_train, X_test = X[:split_idx], X[split_idx:]
+            yv_train, yv_test = y_valence[:split_idx], y_valence[split_idx:]
+            yi_train, yi_test = y_intensity[:split_idx], y_intensity[split_idx:]
             
-            print(cross_corr_matrix)
+            model_valence = RandomForestRegressor(n_estimators=200, random_state=0).fit(X_train, yv_train)
+            print("Valence R^2:", r2_score(yv_test, model_valence.predict(X_test)))
+            X_train, X_test, yi_train, yi_test = train_test_split(X, y_intensity, test_size=0.2, random_state=0)
+            model_intensity = RandomForestRegressor(n_estimators=200, random_state=0).fit(X_train, yi_train)
+            print("Intensity R^2:", r2_score(yi_test, model_intensity.predict(X_test)))
+            importances = pd.Series(model_valence.feature_importances_, index=features)
+            print(importances.sort_values(ascending=False))
+            # print("Actoin: ", action)
 
         self.action = action
         self.spawner.try_spawn()
 
         obs = self._get_obs()
         movement = self._get_movement(obs, action, self.rel_goal_pos)
-
+        prev_pos = self.robot.pos.copy()
         arrived = self.robot.step(movement, self.dt)
+        current_pos = self.robot.pos.copy()
+        self.move_dist = np.linalg.norm(current_pos - prev_pos)
 
         for human in self.spawner.humans:
             human.step(self.dt, self.spawner.humans, self.robot)
             if human.arrived:
-                self.h_arrived = 1
                 self.spawner.check_group_arrived(human.group_id)
-            else:
-                self.h_arrived = 0
-        
+
         obs    = self._get_obs()
         reward = self._get_reward(obs)
 
-        terminate = arrived
-        
-        return obs, reward, terminate, False, self._get_info()
+        if arrived:
+            terminate = True
+            num_step = self.current_step
+            avg_pen = self.cascade_pen / num_step
+            avg_safety_trigger = self.trigger_count / num_step
+
+
+        if self.current_step >= self.max_steps:
+            num_step = self.current_step
+            self.current_step = 0
+            truncate = True
+        self.current_step += 1
+
+        return obs, reward, terminate, truncate, self._get_info(num_step, avg_pen, avg_safety_trigger)
+
 
     def _get_movement(self, obs, action, rel_goal, map_size=5.0, resolution=0.025, robot_radius=0.3):
         human_matrix = obs["agents"]
-
-        mask = human_matrix[:, 2] != 0.0
+        # print("abs_diff:  ", self.abs_diff)
+        mask = human_matrix[:, 7] != 0.0
         valid_human = human_matrix[mask]
         actual_action = action[mask]
 
@@ -418,7 +532,7 @@ class SocialNavEnv(gym.Env):
         y_local = valid_human[:, 1]
         ori     = valid_human[:, 2]
         vel     = valid_human[:, 3]
-        d_dist    = self.dt * vel
+        d_dist    = self.dt * vel * 5.0
         x_next  = x_local + d_dist * np.cos(ori)
         y_next  = y_local + d_dist * np.sin(ori)
 
@@ -445,88 +559,8 @@ class SocialNavEnv(gym.Env):
         goal_y_idx = np.clip(gy_idx, 0, grid_cells - 1)
                 
         phi = np.ones((grid_cells, grid_cells), dtype=np.float32)
-        phi[goal_y_idx, goal_x_idx] = -1.0 # Prevents robot staying stationary
-        """
-        if len(valid_human) >= 2:
-            # gather more human data(ish)
-            r_matrix = np.zeros((5, grid_cells, grid_cells), dtype=np.float32)
-            for i in range(5):
-                random_m = np.random.random(-0.5, 0.5, size=(5, 1))
-                front_size = f_size - random_m
-                random_m = np.random.random(-0.5, 0.5, size=(5, 1))
-                lateral_size = l_size - random_m
-                random_m = np.random.random(-0.5, 0.5, size=(5, 1))
-                back_size = b_size - random_m
-                for i in range(len(valid_human)):
-                    dx_g = w_x - x_local[i]
-                    dy_g = w_y - y_local[i]
+        phi[goal_y_idx, goal_x_idx] = -1.0 # Indicate the goal to FMM algorithm
 
-                    dx_n = w_x - x_next[i]
-                    dy_n = w_y - y_next[i]
-
-                    u = dx_g * cos_a[i] + dy_g * sin_a[i]
-                    v = -dx_g * sin_a[i] + dy_g * cos_a[i]
-
-                    u_n = dx_n * cos_a[i] + dy_n * sin_a[i]
-                    v_n = -dx_n * sin_a[i] + dy_n * cos_a[i]
-                    
-                    semi_long = np.where(u >= 0, front_size[i], back_size[i])
-                    ellipse_dist = np.sqrt((u / semi_long) ** 2 + (v / lateral_size[i]) ** 2)
-
-                    semi_long_n = np.where(u_n >= 0, front_size[i], back_size[i])
-                    ellipse_dist_n = np.sqrt((u_n / semi_long_n) ** 2 + (v_n / lateral_size[i]) ** 2)
-
-                    repulsive_matrix = np.where(ellipse_dist < 1.0, 1.0 / (ellipse_dist + 1e-6), 0.0)
-                    repulsive_matrix_n = np.where(ellipse_dist_n < 1.0, 0.7 * (1.0 / (ellipse_dist_n + 1e-6)), 0.0)
-                    
-                    fin_matrix = np.maximum(repulsive_matrix, repulsive_matrix_n)
-                    r_matrix[i] = np.sum(fin_matrix, axis=0)
-
-            for i in range(5):
-                h_avoid_mode = False
-                # 4. Compute arrival/travel time from the goal to all cells
-                try:
-                    distance_field = skfmm.distance(phi)
-                    travel_time = distance_field / (speed + 1e-6)
-                    # Check if all NaN, if yes enter human avoidance
-                    if np.any(np.isnan(travel_time)):
-                        h_avoid_mode = True
-
-                except Exception:
-                    print("fail")
-                    # Fallback if FMM fails (e.g., goal is completely isolated)
-                    dx, dy = rel_goal
-                    norm = np.hypot(dx, dy) + 1e-8
-                    return np.array([dx / norm, dy / norm], dtype=np.float32)
-                
-                if h_avoid_mode:
-                    min_idx = np.unravel_index(np.argmin(repulsive), repulsive.shape)
-                    best_dy = (min_idx[0] - center) * resolution
-                    best_dx = (min_idx[1] - center) * resolution
-                    norm = np.hypot(best_dx, best_dy) + 1e-8
-                    return np.array([best_dx / norm, best_dy / norm], dtype=np.float32)
-                else:
-                    # 5. Trace the path gradient backwards from center to goal
-                    grad_y, grad_x = np.gradient(travel_time)
-                    
-                    dy = -grad_y[center, center]
-                    dx = -grad_x[center, center]
-                    norm_grad = np.hypot(dx, dy) + 1e-8
-
-                    if norm_grad < 1e-4:
-                        best_dx, best_dy = gx, gy
-                    else:
-                        max_dist = 0.1
-                        best_dx = (dx / norm_grad) * max_dist
-                        best_dy = (dy / norm_grad) * max_dist
-
-                    norm = np.hypot(best_dx, best_dy) + 1e-8
-                    if norm < 0.01:
-                        return np.array([0.0, 0.0], dtype=np.float32)
-                    
-                    return np.array([best_dx / norm, best_dy / norm], dtype=np.float32)
-        """
-                
         for i in range(len(valid_human)):
             dx_g = w_x - x_local[i]
             dy_g = w_y - y_local[i]
@@ -545,9 +579,18 @@ class SocialNavEnv(gym.Env):
 
             semi_long_n = np.where(u_n >= 0, f_size[i], b_size[i])
             ellipse_dist_n = np.sqrt((u_n / semi_long_n) ** 2 + (v_n / l_size[i]) ** 2)
+            raw_curve = np.exp(1.0 - ellipse_dist) - 1.0
+            max_scale = np.exp(1.0) - 1.0
+            intensity = raw_curve / max_scale
+
+            raw_curve_n = np.exp(1.0 - ellipse_dist_n) - 1.0
+            max_scale = np.exp(1.0) - 1.0
+            intensity_n = raw_curve_n / max_scale
 
             repulsive_matrix = np.where(ellipse_dist < 1.0, 1.0 / (ellipse_dist + 1e-6), 0.0)
             repulsive_matrix_n = np.where(ellipse_dist_n < 1.0, 0.7 * (1.0 / (ellipse_dist_n + 1e-6)), 0.0)
+            #repulsive_matrix = np.where(ellipse_dist < 1.0, intensity, 0.0)
+            #repulsive_matrix_n = np.where(ellipse_dist_n < 1.0, 0.7 * intensity_n, 0.0)
             
             fin_matrix = np.maximum(repulsive_matrix, repulsive_matrix_n)
             repulsive += fin_matrix
@@ -555,10 +598,27 @@ class SocialNavEnv(gym.Env):
         h_avoid_mode = False
 
         speed = np.clip(1.0 / (1.0 + repulsive), 0.01, 1.0)
-        # 4. Compute arrival/travel time from the goal to all cells
+        
         try:
             distance_field = skfmm.distance(phi)
             travel_time = distance_field / (speed + 1e-6)
+            """
+            if self.robot.prev_pos is not None:
+                delta = self.robot.pos - self.robot.prev_pos
+                robot_ori = np.arctan2(delta[1], delta[0])
+                robot_vel = np.hypot(delta[0], delta[1]) / self.dt
+                cos_t, sin_t = np.cos(-robot_ori), np.sin(-robot_ori)
+                forward = w_x * cos_t - w_y * sin_t
+                lateral = w_x * sin_t + w_y * cos_t
+    
+                f_reach, b_reach, side_reach = self._get_movable_space(robot_vel)
+                f_reach     = max(f_reach, 2 * resolution)
+                b_reach     = max(b_reach, 2 * resolution)
+                side_reach  = max(side_reach, 2 * resolution)
+                semi_long = np.where(forward >= 0, f_reach, b_reach)
+                feasible_mask = (forward / semi_long)**2 + (lateral / side_reach)**2 <= 1.0
+                travel_time[~feasible_mask] = np.inf
+            """
             # Check if all NaN, if yes enter human avoidance
             if np.any(np.isnan(travel_time)):
                 h_avoid_mode = True
@@ -569,18 +629,20 @@ class SocialNavEnv(gym.Env):
             dx, dy = rel_goal
             norm = np.hypot(dx, dy) + 1e-8
             return self._apply_safety_check(
-                np.array([best_dx / norm, best_dy / norm], dtype=np.float32),
+                np.array([dx / norm, dy / norm], dtype=np.float32),
                 x_next, y_next, robot_speed=self.robot.max_speed  # match your Robot's actual speed constant
             )
+        
         if h_avoid_mode:
             min_idx = np.unravel_index(np.argmin(repulsive), repulsive.shape)
             best_dy = (min_idx[0] - center) * resolution
             best_dx = (min_idx[1] - center) * resolution
             norm = np.hypot(best_dx, best_dy) + 1e-8
-            return self._apply_safety_check(
+            movement = self._apply_safety_check(
                 np.array([best_dx / norm, best_dy / norm], dtype=np.float32),
                 x_next, y_next, robot_speed=self.robot.max_speed  # match your Robot's actual speed constant
             )
+        
         else:
             # 5. Trace the path gradient backwards from center to goal
             grad_y, grad_x = np.gradient(travel_time)
@@ -588,7 +650,6 @@ class SocialNavEnv(gym.Env):
             dy = -grad_y[center, center]
             dx = -grad_x[center, center]
             norm_grad = np.hypot(dx, dy) + 1e-8
-
             if norm_grad < 1e-4:
                 best_dx, best_dy = gx, gy
             else:
@@ -600,11 +661,42 @@ class SocialNavEnv(gym.Env):
             if norm < 0.01:
                 return np.array([0.0, 0.0], dtype=np.float32)
             
-            return self._apply_safety_check(
+            movement = self._apply_safety_check(
                 np.array([best_dx / norm, best_dy / norm], dtype=np.float32),
                 x_next, y_next, robot_speed=self.robot.max_speed  # match your Robot's actual speed constant
             )
-        
+
+        if np.allclose(movement, 0.0, atol=1e-6):
+            dists_now = np.hypot(x_local, y_local)  # humans relative to robot, already local frame
+            nearest = np.argmin(dists_now)
+            away_dx = -x_local[nearest]
+            away_dy = -y_local[nearest]
+            norm = np.hypot(away_dx, away_dy) + 1e-8
+            escape_dir = np.array([away_dx / norm, away_dy / norm], dtype=np.float32)
+            # move a small fixed step away, uncapped by the joint safety check
+            step = self.robot.max_speed * self.dt
+            return escape_dir * step
+        else:
+            return(movement)
+
+    def _get_movable_space(self, vel):
+        a_max, w_max_0, dt, vel_max = 0.6, 1.5, self.dt, 1.0
+        f_reach = vel * dt + 0.5 * a_max * dt**2          # front: cruise + accel headroom
+        b_reach = max(0.5 * a_max * dt**2, 0.02)           # back: brake/creep room only, much smaller
+        ratio = np.clip(vel / vel_max, 0.0, 1.0)
+        side_reach = max(0.05, w_max_0 * dt * (1 - ratio) * f_reach)  # narrows as speed → vel_max
+        return f_reach, b_reach, side_reach
+
+    def build_kinematic_mask(grid_x, grid_y, theta_r, f_min, f_max, l_min, l_max):
+        # grid_x, grid_y: meshgrid of cell centers in world/grid frame, relative to robot position
+        cos_t, sin_t = np.cos(-theta_r), np.sin(-theta_r)   # inverse rotation
+        forward = grid_x * cos_t - grid_y * sin_t
+        lateral = grid_x * sin_t + grid_y * cos_t
+
+        mask = (forward >= f_min) & (forward <= f_max) & \
+            (lateral >= l_min) & (lateral <= l_max)
+        return mask
+    
     def _apply_safety_check(self, direction, x_next, y_next, robot_speed,
                             robot_radius=0.3, human_radius=0.3, margin=0.05):
 
@@ -629,44 +721,34 @@ class SocialNavEnv(gym.Env):
         # relative to the robot's own motion, but guard anyway:
         return np.array([0.0, 0.0], dtype=np.float32)
 
-    
-    def _future_prediction(self, action, x_next, y_next):
-        # Prediction future movement and reward
-        reward = 0.0
-        self.tot_soc_pen = 0.0
-        # grid to real robot pos
-        # find which has greatest impact on valence and intensity and ues the corresponding observation
-
-        for i in range(len(x_next)):
-            dist = np.sqrt((x_next - self.robot.pos[0]) ** 2 + (y_next - self.robot.pos[1]) ** 2)
-            # correlation:
-            valence = self.correlation[0][4] * dist
-            if valence < 0.0:
-                intensity = self.correlation[0][4] * dist
-                reward += valence * intensity * 5.0
-                self.tot_soc_pen += valence * intensity * 5.0
-
 
 # ----- Matplotlib Visualiseation -----
 
-def get_proxemic_polygon(pos_x, pos_y, orientation, sigma_front, sigma_side, num_points=100):
+def get_asymmetric_proxemic_polygon(pos_x, pos_y, orientation, sigma_front, sigma_side, sigma_back, num_points=100):
     if orientation is None:
         orientation = 0.0
+        
     # 1. Sample angles around a circle (relative to agent's heading)
     gamma = np.linspace(0, 2 * np.pi, num_points)
     
-    denom = (np.cos(gamma)**2 / (sigma_front**2)) + (np.sin(gamma)**2 / (sigma_side**2))
+    # 2. Assign dynamic longitudinal sigma based on front vs. back
+    # cos(gamma) > 0 means the point is in front; cos(gamma) <= 0 means it is behind
+    sigma_long = np.where(np.cos(gamma) >= 0, sigma_front, sigma_back)
+    
+    # 3. Calculate radius for each angle using the asymmetric denominator
+    denom = (np.cos(gamma)**2 / (sigma_long**2)) + (np.sin(gamma)**2 / (sigma_side**2))
     r = 1.0 / np.sqrt(denom)
     
+    # 4. Transform to local coordinates
     local_x = r * np.cos(gamma)
     local_y = r * np.sin(gamma)
     
+    # 5. Rotate and translate to world coordinates
     world_x = pos_x + (local_x * np.cos(orientation) - local_y * np.sin(orientation))
     world_y = pos_y + (local_x * np.sin(orientation) + local_y * np.cos(orientation))
     
-    # 5. Stack into an array of (x, y) coordinates for the polygon
-    polygon_points = np.column_stack((world_x, world_y))
-    return polygon_points
+    # 6. Stack into an array of (x, y) coordinates
+    return np.column_stack((world_x, world_y))
 
 BEHAVIOUR_COLORS = {
     'collision':    'red',
@@ -693,25 +775,48 @@ def get_personality(stability, plasticity):
         return 'sad'
 
 def draw(env, ax):
-    print(f"drawing: {len(env.spawner.humans)} humans, robot at {env.robot.pos}")
+    action = env.action
+    # print(f"drawing: {len(env.spawner.humans)} humans, robot at {env.robot.pos}")
+    # print("Action: ", action)
+    # print("Observation: ", env._get_obs())
     ax.clear()
-    ax.set_xlim(-0.5, env.width - 0.5)
-    ax.set_ylim(-0.5, env.height - 0.5)
+    ax.set_xlim(-0.5, env.width + 0.5)
+    ax.set_ylim(-0.5, env.height + 0.5)
     ax.set_aspect('equal')
     ax.set_facecolor('#1a1a2e')
     ax.grid(True, color = 'white', linewidth = 0.2, alpha = 0.3)
     ax.set_xticks(range(env.width))
     ax.set_yticks(range(env.height))
 
+    if getattr(env, 'feasible_mask', None) is not None:
+        masked = np.ma.masked_where(~env.feasible_mask, env.feasible_mask.astype(float))
+        ax.imshow(
+            masked,
+            extent=[env.feasible_grid_x.min(), env.feasible_grid_x.max(),
+                    env.feasible_grid_y.min(), env.feasible_grid_y.max()],
+            origin='lower', cmap='Greens', alpha=0.4, zorder=0,
+        )
     arrow_len = 0.5
+    human_matrix = env._get_obs()["agents"]
+    matrix_ids = [row[-1] for row in human_matrix] 
+
     for agent in env.spawner.humans:
+        h_id = agent.human_id
+        a_front, a_side, a_back = 0, 0, 0
+        
+        # Directly find which row index matches this human's ID
+        if h_id in matrix_ids:
+            i = matrix_ids.index(h_id)
+            a_front, a_side, a_back = action[i]
+
         x, y = agent.pos
         orientation = agent.orientation if agent.orientation is not None else 0.0
-        ps_front, ps_side = agent.ps_front, agent.ps_side
+        ps_front, ps_side, ps_back = agent.ps_front, agent.ps_side, agent.ps_back
         color = BEHAVIOUR_COLORS.get(agent.behaviour_type, 'lightgray')
         personality = get_personality(agent.stability, agent.plasticity)
         marker = PERSONALITY_MARKERS.get(personality, 'o')
-        poly_points = get_proxemic_polygon(x, y, orientation, ps_front, ps_side)
+
+        poly_points = get_asymmetric_proxemic_polygon(x, y, orientation, ps_front, ps_side, ps_back)
 
         dx = arrow_len * np.cos(orientation)
         dy = arrow_len * np.sin(orientation)
@@ -735,6 +840,15 @@ def draw(env, ax):
         )
         ax.add_patch(proxemic_zone)
 
+        if a_front != 0 or a_side != 0 or a_back != 0:
+            poly_points_action = get_asymmetric_proxemic_polygon(x, y, orientation, a_front, a_side, a_back)
+            proxemic_zone_a = mpatches.Polygon(
+                poly_points_action, closed=True, 
+                facecolor='blue', edgecolor='blue', 
+                linestyle='--', alpha=0.15
+            )
+            ax.add_patch(proxemic_zone_a)
+            
         ax.plot(x, y, marker=marker, color=color, 
                 markersize=10, markeredgecolor='white',
                 markeredgewidth=0.5, zorder=2)
